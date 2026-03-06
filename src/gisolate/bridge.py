@@ -60,6 +60,8 @@ class ProcessBridge:
             raise RuntimeError("Cannot call() in server mode")
         if not self._mode:
             self._start_client()
+        elif self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.ensure_future(self._read_responses())
 
         req_id = (next(self._req_id) & 0xFFFFFFFF).to_bytes(4)
         fut: asyncio.Future[tuple[bytes, bytes]] = (

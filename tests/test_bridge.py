@@ -118,3 +118,18 @@ class TestProcessBridgeRPC:
         results = asyncio.run(client_calls())
         assert results == [0, 1, 4, 9, 16]
         server.close()
+
+    def test_multiple_asyncio_run_calls(self):
+        """Client survives across separate asyncio.run() calls (reader task revival)."""
+        addr = _make_addr()
+        server = ProcessBridge(addr, mode="server")
+        _ = server.address
+
+        import asyncio
+
+        client = ProcessBridge(addr, mode="client")
+        for i in range(3):
+            result = asyncio.run(client.call(lambda x: x * 2, i, timeout=5))
+            assert result == i * 2
+        client.close()
+        server.close()
