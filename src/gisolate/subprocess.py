@@ -15,14 +15,14 @@ _EMPTY = object()
 
 def _worker(conn: Any, fn: Callable, fn_args: tuple, fn_kwargs: dict) -> None:
     """Worker entry point for run_in_subprocess."""
-    from ._internal import wrap_exception
+    from ._internal import SmartPickle, wrap_exception
 
     try:
-        conn.send(("ok", fn(*fn_args, **fn_kwargs)))
+        conn.send_bytes(SmartPickle.dumps(("ok", fn(*fn_args, **fn_kwargs))))
     except Exception as e:
         import traceback
 
-        conn.send(("error", wrap_exception(e, traceback.format_exc())))
+        conn.send_bytes(SmartPickle.dumps(("error", wrap_exception(e, traceback.format_exc()))))
     finally:
         conn.close()
 
@@ -65,10 +65,12 @@ def run_in_subprocess(
     child_conn.close()
 
     def try_recv() -> Any:
+        from ._internal import SmartPickle
+
         if not parent_conn.poll(0):
             return _EMPTY
         try:
-            msg = parent_conn.recv()
+            msg = SmartPickle.loads(parent_conn.recv_bytes())
         except EOFError:
             return _EMPTY
         match msg:

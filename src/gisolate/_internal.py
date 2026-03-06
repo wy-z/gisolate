@@ -1,6 +1,7 @@
 """Internal primitives: unpatched stdlib, exceptions, serialization."""
 
 import contextlib
+import io
 import pickle
 from typing import Any
 
@@ -52,20 +53,24 @@ class SmartPickle:
     def dumps(cls, obj: Any) -> bytes:
         if type(obj) in cls._dill_types:
             return cls._DILL + dill.dumps(obj)
+        buf = io.BytesIO()
+        buf.write(cls._PICKLE)
         try:
-            return cls._PICKLE + pickle.dumps(obj, protocol=5)
+            pickle.dump(obj, buf, protocol=5)
         except (pickle.PicklingError, TypeError, AttributeError):
             t = type(obj)
             if t not in cls._BUILTIN_CONTAINERS:
                 cls._dill_types.add(t)
             return cls._DILL + dill.dumps(obj)
+        return buf.getvalue()
 
     @classmethod
     def loads(cls, data: bytes) -> Any:
-        tag, payload = data[:1], data[1:]
+        mv = memoryview(data)
+        tag = mv[:1]
         if tag == cls._PICKLE:
-            return pickle.loads(payload)
-        return dill.loads(payload)
+            return pickle.loads(mv[1:])
+        return dill.loads(bytes(mv[1:]))
 
 
 def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:
