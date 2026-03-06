@@ -1,0 +1,6 @@
+pre-commit:
+  commands:
+    pyright:
+      run: pyright --level error .
+    pytest:
+      run: pytest
