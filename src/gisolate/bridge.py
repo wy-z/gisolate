@@ -7,10 +7,9 @@ import os
 from typing import Any, Callable
 
 import gevent
-import gevent.pool
 
 from ._internal import SmartPickle, wrap_exception
-from ._workers import _ERR, _OK, _SHUTDOWN
+from ._workers import _ERR, _OK, _SHUTDOWN, _safe_dumps
 
 log = logging.getLogger(__name__)
 
@@ -148,14 +147,15 @@ class ProcessBridge:
             try:
                 func, args, kwargs = SmartPickle.loads(payload)
                 data = func(*args, **kwargs)
-                status = _OK
+                ok = True
             except Exception as exc:
                 data = wrap_exception(exc, traceback.format_exc())
-                status = _ERR
+                ok = False
+            resp, ok = _safe_dumps(data, ok)
             with send_lock:
                 with contextlib.suppress(zmq_mod.ZMQError):
                     self._sock.send_multipart(
-                        [identity, req_id, status, SmartPickle.dumps(data)]
+                        [identity, req_id, _OK if ok else _ERR, resp]
                     )
 
         try:

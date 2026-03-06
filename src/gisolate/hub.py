@@ -43,6 +43,7 @@ class AsyncResult:
 
 
 _queue = _internal.Queue()
+_lock = _internal.RLock()
 _started = False
 _stopping = False
 _greenlet: gevent.Greenlet | None = None
@@ -61,7 +62,7 @@ def _loop():
             func, result = _queue.get_nowait()
             log.debug(f"Main hub picked up task: {func}")
         except _internal.QueueEmpty:
-            gevent.sleep(0.005)
+            gevent.sleep(0.01)
             continue
         if result is None:
             gevent.spawn(_task, func)
@@ -74,26 +75,55 @@ def _loop():
 
 
 def ensure_started() -> None:
-    """Lazily start the main hub loop. Safe to call multiple times."""
+    """Lazily start the main hub loop. Thread-safe.
+
+    Must be called from the main thread on first invocation so that
+    the hub greenlet is spawned on the default (main) event loop.
+    ProcessProxy.__init__ calls this, ensuring correct ownership when
+    the proxy is created on the main thread.
+    """
     global _started, _stopping, _greenlet
     if _started and not _stopping:
         return
-    _stopping = False
-    _started = True
-    _greenlet = gevent.spawn(_loop)
+    with _lock:
+        if _started and not _stopping:
+            return
+        if not gevent.get_hub().loop.default:
+            raise RuntimeError(
+                "Hub must be started from the main thread. "
+                "Create your first ProcessProxy on the main thread."
+            )
+        _stopping = False
+        _greenlet = gevent.spawn(_loop)
+        _started = True
 
 
 def shutdown() -> None:
     """Stop the main hub loop. Safe to call multiple times."""
     global _started, _stopping, _greenlet
-    if not _started:
-        return
-    _stopping = True
-    if _greenlet is not None:
-        _greenlet.join(timeout=2)
-        _greenlet.kill(block=False)
+    with _lock:
+        if not _started:
+            return
+        _stopping = True
+        greenlet = _greenlet
         _greenlet = None
-    _started = False
+        _started = False
+    if greenlet is not None:
+        greenlet.join(timeout=2)
+        greenlet.kill(block=False)
+    _fail_pending()
+
+
+def _fail_pending() -> None:
+    """Fail all tasks remaining in queue after shutdown."""
+    err = RuntimeError("Hub is shutting down")
+    while True:
+        try:
+            _, result = _queue.get_nowait()
+        except _internal.QueueEmpty:
+            return
+        if result is not None:
+            result.set_exception(err)
 
 
 def _cleanup_resource_tracker() -> None:
@@ -115,20 +145,26 @@ def _cleanup_resource_tracker() -> None:
             tracker._fd = None  # type: ignore[attr-defined]
 
 
-# atexit handlers run in LIFO order: clean resource tracker last (registered first)
-atexit.register(shutdown)
+# atexit runs in LIFO order: shutdown hub first, then clean resource tracker
 atexit.register(_cleanup_resource_tracker)
+atexit.register(shutdown)
 
 
 def run_on_main_hub(func: Callable) -> Any:
     """Run function on main hub and wait for result. Thread-safe."""
     ensure_started()
-    ar = AsyncResult()
-    _queue.put((func, ar))
+    with _lock:
+        if _stopping:
+            raise RuntimeError("Hub is shutting down")
+        ar = AsyncResult()
+        _queue.put((func, ar))
     return ar.get()
 
 
 def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
     """Schedule function on main hub without waiting. Thread-safe, fire-and-forget."""
     ensure_started()
-    _queue.put((functools.partial(func, *args, **kwargs), None))
+    with _lock:
+        if _stopping:
+            return
+        _queue.put((functools.partial(func, *args, **kwargs), None))

@@ -1,6 +1,6 @@
 # gisolate
 
-> *Gevent has hurt me a thousand times, yet I keep coming back for more. This library is proof of that love.*
+> *Gevent has tormented me a thousand times, yet I keep coming back for more. This library is proof of that love.*
 
 Process isolation for gevent applications. Run any object in a clean subprocess, call its methods transparently via ZMQ IPC.
 

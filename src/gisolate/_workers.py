@@ -1,6 +1,7 @@
 """Child process worker entry points: gevent and asyncio modes."""
 
 import contextlib
+import traceback
 from typing import Any
 
 import dill
@@ -14,6 +15,14 @@ _ERR = b"\x00"
 _SHUTDOWN = b""
 
 
+def _safe_dumps(data: Any, ok: bool) -> tuple[bytes, bool]:
+    """Serialize data, falling back to wrapped error on failure."""
+    try:
+        return SmartPickle.dumps(data), ok
+    except Exception as exc:
+        return SmartPickle.dumps(wrap_exception(exc, traceback.format_exc())), False
+
+
 def safe_close(client: Any) -> None:
     """Safely call client.close() if it exists."""
     if close := getattr(client, "close", None):
@@ -25,8 +34,6 @@ def gevent_worker(
     ipc_addr: str, factory_bytes: bytes, timeout: float, patch_kwargs: dict
 ):
     """Gevent-based worker with greenlet concurrency."""
-    import traceback
-
     import gevent
     import gevent.lock
     import gevent.monkey
@@ -48,10 +55,11 @@ def gevent_worker(
     group = gevent.pool.Group()
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
+        resp, ok = _safe_dumps(data, ok)
         with send_lock:
             with contextlib.suppress(zmq.ZMQError):
                 sock.send_multipart(
-                    [identity, req_id, _OK if ok else _ERR, SmartPickle.dumps(data)]
+                    [identity, req_id, _OK if ok else _ERR, resp]
                 )
 
     def handle(identity: bytes, req_id: bytes, method: str, args: tuple, kwargs: dict):
@@ -101,7 +109,6 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
     """Asyncio-based worker for async clients."""
     import asyncio
     import inspect
-    import traceback
 
     import zmq.asyncio
 
@@ -122,9 +129,10 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
             return client
 
     async def send(sock, identity: bytes, req_id: bytes, ok: bool, data: Any):
+        resp, ok = _safe_dumps(data, ok)
         with contextlib.suppress(zmq.ZMQError):
             await sock.send_multipart(
-                [identity, req_id, _OK if ok else _ERR, SmartPickle.dumps(data)]
+                [identity, req_id, _OK if ok else _ERR, resp]
             )
 
     async def handle(

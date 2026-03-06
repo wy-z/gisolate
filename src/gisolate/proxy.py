@@ -222,9 +222,18 @@ class ProcessProxy(abc.ABC):
         self._stop(timeout=timeout)
 
     def __del__(self):
+        # Minimal cleanup only — avoid full shutdown() which marshals
+        # to main hub and may fail during GC or interpreter shutdown.
         with contextlib.suppress(Exception):
-            if getattr(self, "_process", None) is not None:
-                self.shutdown()
+            process = getattr(self, "_process", None)
+            if process is not None:
+                process.terminate()
+            sock = getattr(self, "_sock", None)
+            if sock is not None:
+                sock.close(linger=0)
+            ctx = getattr(self, "_ctx", None)
+            if ctx is not None:
+                ctx.term()
 
     def __enter__(self):
         return self
