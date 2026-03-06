@@ -78,6 +78,8 @@ def run_in_subprocess(
                 if tb := getattr(exc, "__remote_traceback__", None):
                     log.error(f"Subprocess traceback:\n{tb}")
                 raise exc
+            case _:
+                raise RuntimeError(f"Malformed subprocess message: {msg!r}")
 
     def cleanup():
         parent_conn.close()
