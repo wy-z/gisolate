@@ -1,8 +1,10 @@
 """ThreadLocalProxy: transparent proxy with true thread-local isolation."""
 
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from . import _internal
+
+T = TypeVar("T")
 
 
 class ThreadLocalProxy:
@@ -10,9 +12,15 @@ class ThreadLocalProxy:
 
     Uses original (unpatched) threading.local to ensure true thread isolation,
     even in patched environments where gevent.threadpool uses real threads.
+
+    Type-transparent: ``ThreadLocalProxy(factory)`` is typed as the return type
+    of *factory*, so IDE autocompletion and type checking work as expected.
     """
 
     __slots__ = ("_factory", "_local")
+
+    def __new__(cls, factory: Callable[[], T]) -> T:  # type: ignore[misc]
+        return object.__new__(cls)  # type: ignore[return-value]
 
     def __init__(self, factory: Callable[[], Any]):
         object.__setattr__(self, "_factory", factory)

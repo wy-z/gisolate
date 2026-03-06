@@ -91,6 +91,8 @@ class ProcessBridge:
         try:
             while True:
                 parts = await self._sock.recv_multipart()
+                if len(parts) < 3:
+                    continue
                 resp_id, status, payload = parts[:3]
                 if fut := self._pending.get(resp_id):
                     if not fut.done():
@@ -158,7 +160,10 @@ class ProcessBridge:
             while not self._shutdown:
                 if not self._sock.poll(100):
                     continue
-                identity, req_id, payload = self._sock.recv_multipart()[:3]  # type: ignore[index]
+                parts: list[bytes] = self._sock.recv_multipart()  # type: ignore[assignment]
+                if len(parts) < 3:
+                    continue
+                identity, req_id, payload = parts[:3]
                 if payload == _SHUTDOWN:
                     break
                 group.spawn(_handle, identity, req_id, payload)

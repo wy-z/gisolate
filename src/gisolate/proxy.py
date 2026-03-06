@@ -11,7 +11,7 @@ import signal
 import tempfile
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import dill
 import gevent
@@ -23,8 +23,17 @@ from ._internal import ProcessError, SmartPickle
 from ._workers import _OK, _SHUTDOWN, asyncio_worker, gevent_worker
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
-_ZMQ_TMPDIR = tempfile.gettempdir()
+
+def _get_ipc_dir() -> str:
+    """Get a private directory for IPC sockets (mode 0o700)."""
+    d = os.path.join(tempfile.gettempdir(), f"gi-{os.getuid()}")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+_ZMQ_TMPDIR = _get_ipc_dir()
 _default_mp_context: Any = None
 
 
@@ -116,7 +125,7 @@ class ProcessProxy(abc.ABC):
                 return
 
             cls = type(self)
-            self._addr = f"ipc://{_ZMQ_TMPDIR}/gisolate-{uuid.uuid4().hex}.sock"
+            self._addr = f"ipc://{_ZMQ_TMPDIR}/gi-{uuid.uuid4().hex[:16]}.sock"
             self._ctx = zmq_green.Context()
             self._sock = self._ctx.socket(zmq_green.DEALER)
             self._sock.setsockopt(zmq.LINGER, 0)
@@ -254,13 +263,19 @@ class ProcessProxy(abc.ABC):
         """Receive and dispatch all available responses."""
         while True:
             try:
-                req_id_bytes, ok_flag, payload = self._sock.recv_multipart(zmq.NOBLOCK)[
-                    :3
-                ]
+                parts = self._sock.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
                 return
-            req_id, ok = _unpack_id(req_id_bytes), ok_flag == _OK
-            result = SmartPickle.loads(payload)
+            if len(parts) < 3:
+                continue
+            req_id_bytes, ok_flag, payload = parts[:3]
+            req_id = _unpack_id(req_id_bytes)
+            try:
+                result = SmartPickle.loads(payload)
+                ok = ok_flag == _OK
+            except Exception as e:
+                log.warning(f"Failed to deserialize response: {e}")
+                result, ok = ProcessError(f"Bad response: {e}"), False
             if not ok and (tb := getattr(result, "__remote_traceback__", None)):
                 log.error(f"Remote traceback:\n{tb}")
             with self._lock:
@@ -334,12 +349,12 @@ class ProcessProxy(abc.ABC):
     @classmethod
     def create(
         cls,
-        factory: Callable[[], Any],
+        factory: Callable[[], T],
         *,
         timeout: float = 24,
         mp_context: Any = None,
         patch_kwargs: dict | None = None,
-    ) -> "ProcessProxy":
+    ) -> T:  # type: ignore[misc]
         """Create a proxy without subclassing.
 
         Args:
@@ -356,4 +371,4 @@ class ProcessProxy(abc.ABC):
         if mp_context is not None:
             ns["mp_context"] = mp_context
         klass = type(f"ProcessProxy<{factory.__qualname__}>", (cls,), ns)
-        return klass()
+        return klass()  # type: ignore[return-value]

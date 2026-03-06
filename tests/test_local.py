@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false
 """Tests for gisolate.local module."""
 
 import gevent

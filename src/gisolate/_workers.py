@@ -69,12 +69,19 @@ def gevent_worker(
         """Drain all available messages. Returns False on shutdown."""
         while True:
             try:
-                identity, req_id, payload = sock.recv_multipart(zmq.NOBLOCK)[:3]
+                parts = sock.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
                 return True
+            if len(parts) < 3:
+                continue
+            identity, req_id, payload = parts[:3]
             if payload == _SHUTDOWN:
                 return False
-            method, args, kwargs = SmartPickle.loads(payload)
+            try:
+                method, args, kwargs = SmartPickle.loads(payload)
+            except Exception:
+                send(identity, req_id, False, ValueError("malformed request"))
+                continue
             group.spawn(handle, identity, req_id, method, args, kwargs)
 
     try:
@@ -163,10 +170,17 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
             while True:
                 if not await poller.poll(1000):
                     continue
-                identity, req_id, payload = (await sock.recv_multipart())[:3]
+                parts = await sock.recv_multipart()
+                if len(parts) < 3:
+                    continue
+                identity, req_id, payload = parts[:3]
                 if payload == _SHUTDOWN:
                     break
-                method, args, kwargs = SmartPickle.loads(payload)
+                try:
+                    method, args, kwargs = SmartPickle.loads(payload)
+                except Exception:
+                    await send(sock, identity, req_id, False, ValueError("malformed request"))
+                    continue
                 task = asyncio.create_task(
                     handle(sock, identity, req_id, method, args, kwargs)
                 )

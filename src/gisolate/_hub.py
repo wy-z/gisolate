@@ -59,6 +59,7 @@ def _loop():
     while not _stopping:
         try:
             func, result = _queue.get_nowait()
+            log.debug(f"Main hub picked up task: {func}")
         except _internal.QueueEmpty:
             gevent.sleep(0.005)
             continue

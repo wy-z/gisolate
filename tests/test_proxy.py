@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false, reportGeneralTypeIssues=false
 """Tests for gisolate.proxy module (ProcessProxy)."""
 
 import multiprocessing
