@@ -18,7 +18,7 @@ import gevent
 import gevent.event
 import zmq
 
-from . import _hub, _internal
+from . import _internal, hub
 from ._internal import ProcessError, SmartPickle
 from ._workers import _OK, _SHUTDOWN, asyncio_worker, gevent_worker
 
@@ -104,7 +104,7 @@ class ProcessProxy(abc.ABC):
         self._sock: Any = None
         self._addr: str | None = None
         self._owner = _internal.current_thread()
-        _hub.ensure_started()
+        hub.ensure_started()
         self._start()
 
     # --- Lifecycle ---
@@ -115,7 +115,7 @@ class ProcessProxy(abc.ABC):
     def _start(self):
         """Start child process if not running."""
         if not gevent.get_hub().loop.default:
-            return _hub.run_on_main_hub(self._start)
+            return hub.run_on_main_hub(self._start)
 
         import zmq.green as zmq_green
 
@@ -204,7 +204,7 @@ class ProcessProxy(abc.ABC):
     def restart_process(self) -> None:
         """Kill and restart child process. Thread-safe (marshals to main hub)."""
         if not gevent.get_hub().loop.default:
-            return _hub.run_on_main_hub(self.restart_process)
+            return hub.run_on_main_hub(self.restart_process)
         with self._lock:
             now = time.monotonic()
             if self._is_alive() and now - self._last_restart < self.RESTART_COOLDOWN:
@@ -217,7 +217,7 @@ class ProcessProxy(abc.ABC):
     def shutdown(self, timeout: float = 10.0):
         """Gracefully shutdown child process. Thread-safe."""
         if not gevent.get_hub().loop.default:
-            return _hub.run_on_main_hub(functools.partial(self.shutdown, timeout))
+            return hub.run_on_main_hub(functools.partial(self.shutdown, timeout))
         self._shutdown = True
         self._stop(timeout=timeout)
 
@@ -293,7 +293,7 @@ class ProcessProxy(abc.ABC):
         ar = (
             gevent.event.AsyncResult()
             if _internal.current_thread() is self._owner
-            else _hub.AsyncResult()
+            else hub.AsyncResult()
         )
         with self._lock:
             self._pending[req_id] = ar

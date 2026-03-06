@@ -1,9 +1,9 @@
-"""Tests for gisolate._hub module."""
+"""Tests for gisolate.hub module."""
 
 import gevent
 import pytest
-from gisolate._hub import (AsyncResult, ensure_started, run_on_main_hub,
-                           spawn_on_main_hub)
+from gisolate.hub import (AsyncResult, ensure_started, run_on_main_hub,
+                          spawn_on_main_hub)
 
 
 class TestAsyncResult:
