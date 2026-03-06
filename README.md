@@ -135,6 +135,18 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 
 Transparent proxy delegating attribute access to a per-thread instance.
 
+### `spawn_on_main_hub(func, *args, **kwargs)`
+
+Schedule a function on the main gevent hub without waiting. Thread-safe, fire-and-forget.
+
+### `ProcessError`
+
+Raised when a child process dies or communication fails.
+
+### `RemoteError`
+
+Wrapper for exceptions from the child process that can't be pickled. Preserves the original exception type name and message.
+
 ### `shutdown_hub()`
 
 Explicitly stop the internal gevent hub loop. Registered via `atexit` automatically.
