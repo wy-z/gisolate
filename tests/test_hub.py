@@ -2,8 +2,8 @@
 
 import gevent
 import pytest
-
-from gisolate._hub import AsyncResult, ensure_started, run_on_main_hub, spawn_on_main_hub
+from gisolate._hub import (AsyncResult, ensure_started, run_on_main_hub,
+                           spawn_on_main_hub)
 
 
 class TestAsyncResult:
@@ -20,7 +20,7 @@ class TestAsyncResult:
 
     def test_get_timeout(self):
         ar = AsyncResult()
-        with pytest.raises(gevent.Timeout):
+        with pytest.raises(TimeoutError):
             ar.get(timeout=0.01)
 
     def test_set_none(self):

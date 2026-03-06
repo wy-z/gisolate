@@ -11,6 +11,15 @@ from .local import ThreadLocalProxy
 from .proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 from .subprocess import run_in_subprocess
 
+# Pre-initialize threadpoolctl on main thread to cache library info.
+# Avoids subprocess calls when sklearn runs in threadpool workers.
+try:
+    import threadpoolctl  # type: ignore[import-untyped]
+
+    threadpoolctl.ThreadpoolController()
+except Exception:
+    pass
+
 __all__ = [
     "ProcessBridge",
     "ProcessError",

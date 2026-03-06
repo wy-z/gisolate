@@ -309,6 +309,8 @@ class ProcessProxy(abc.ABC):
             with self._lock:
                 self._error_count = 0
             return result
+        except gevent.Timeout:
+            raise TimeoutError(f"{method} timed out after {self.timeout}s") from None
         except ProcessError:
             with self._lock:
                 self._error_count += 1

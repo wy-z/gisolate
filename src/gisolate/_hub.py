@@ -36,7 +36,7 @@ class AsyncResult:
 
     def get(self, timeout=None):
         if not self._event.wait(timeout):
-            raise gevent.Timeout(timeout)
+            raise TimeoutError(f"Timed out after {timeout}s")
         if self._ok:
             return self._value
         raise self._value  # type: ignore[misc]
