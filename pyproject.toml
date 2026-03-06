@@ -1,14 +1,28 @@
 [project]
 name = "gisolate"
-version = "0.1.0"
-description = "Process isolation for gevent applications"
+version = "0.1.1"
+description = "Process isolation for gevent applications — run any object in a clean subprocess, call methods transparently via ZMQ IPC."
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
+keywords = ["gevent", "process", "isolation", "subprocess", "zmq", "ipc", "monkey-patch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "gevent>=24.0",
     "pyzmq>=26.0",
     "dill>=0.3.8",
 ]
+
+[project.urls]
+Repository = "https://github.com/wy-z/gisolate"
 
 [build-system]
 requires = ["hatchling"]
