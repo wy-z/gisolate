@@ -9,7 +9,7 @@ import pytest
 
 from gisolate.proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 
-from .helpers import adder_factory
+from .helpers import adder_factory, tracker_factory
 
 
 class TestDefaultMpContext:
@@ -95,3 +95,54 @@ class TestProcessProxyConcurrency:
             gevent.joinall(greenlets, timeout=15)
             results = sorted(g.value for g in greenlets if g.value is not None)
             assert results == [i * 2 for i in range(10)]
+
+
+class TestMaxConcurrency:
+    def test_asyncio_worker_limits_concurrency(self):
+        with ProcessProxy.create(
+            tracker_factory, timeout=10, max_concurrency=2
+        ) as proxy:
+            greenlets = [gevent.spawn(proxy.run, 0.3) for _ in range(6)]
+            gevent.joinall(greenlets, timeout=15)
+            peak = proxy.get_peak()
+            assert peak <= 2
+
+    def test_gevent_worker_limits_concurrency(self):
+        with ProcessProxy.create(
+            tracker_factory,
+            timeout=10,
+            max_concurrency=2,
+            patch_kwargs={"thread": False, "os": False},
+        ) as proxy:
+            greenlets = [gevent.spawn(proxy.run, 0.3) for _ in range(6)]
+            gevent.joinall(greenlets, timeout=15)
+            peak = proxy.get_peak()
+            assert peak <= 2
+
+    def test_unlimited_concurrency_by_default(self):
+        with ProcessProxy.create(tracker_factory, timeout=10) as proxy:
+            greenlets = [gevent.spawn(proxy.run, 0.3) for _ in range(6)]
+            gevent.joinall(greenlets, timeout=15)
+            peak = proxy.get_peak()
+            assert peak > 2
+
+
+class TestPerCallTimeout:
+    def test_execute_timeout_overrides_default(self):
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            with pytest.raises(TimeoutError):
+                proxy._execute("slow", (5,), {}, 0.5)
+
+    def test_with_timeout_overrides_default(self):
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            with pytest.raises(TimeoutError):
+                proxy.with_timeout(0.5).slow(5)
+
+    def test_with_timeout_allows_longer(self):
+        with ProcessProxy.create(adder_factory, timeout=1) as proxy:
+            assert proxy.with_timeout(10).slow(0.5) == "done"
+
+    def test_timeout_kwarg_forwarded_to_remote(self):
+        """Ensure 'timeout' kwarg is not consumed by execute()."""
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            assert proxy.echo_timeout(timeout=42) == 42

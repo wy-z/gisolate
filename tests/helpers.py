@@ -1,6 +1,35 @@
 """Shared test helpers — importable by child processes (must be top-level picklable)."""
 
 import os
+import threading
+
+
+class ConcurrencyTracker:
+    """Tracks peak concurrent executions."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._current = 0
+        self.peak = 0
+
+    def run(self, seconds=0.2):
+        import time
+
+        with self._lock:
+            self._current += 1
+            if self._current > self.peak:
+                self.peak = self._current
+        time.sleep(seconds)
+        with self._lock:
+            self._current -= 1
+        return self.peak
+
+    def get_peak(self):
+        return self.peak
+
+
+def tracker_factory():
+    return ConcurrencyTracker()
 
 
 class Adder:
@@ -9,6 +38,9 @@ class Adder:
 
     def echo(self, x):
         return x
+
+    def echo_timeout(self, timeout=10):
+        return timeout
 
     def fail(self):
         raise ValueError("intentional error")

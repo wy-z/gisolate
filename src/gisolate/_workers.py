@@ -1,6 +1,7 @@
 """Child process worker entry points: gevent and asyncio modes."""
 
 import contextlib
+import dataclasses
 import traceback
 from typing import Any
 
@@ -8,6 +9,17 @@ import dill
 import zmq
 
 from ._internal import SmartPickle, wrap_exception
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class WorkerConfig:
+    """Configuration passed from ProcessProxy to child worker."""
+
+    ipc_addr: str
+    factory_bytes: bytes
+    timeout: float
+    max_concurrency: int | None = None
+
 
 # ZMQ message markers (shared with proxy.py)
 _OK = b"\x01"
@@ -30,9 +42,13 @@ def safe_close(client: Any) -> None:
             close()
 
 
-def gevent_worker(
-    ipc_addr: str, factory_bytes: bytes, timeout: float, patch_kwargs: dict
-):
+def _unpack(payload: bytes, default_timeout: float) -> tuple[str, tuple, dict, float]:
+    """Unpack request payload (3-tuple legacy or 4-tuple with timeout)."""
+    method, args, kwargs, *rest = SmartPickle.loads(payload)
+    return method, args, kwargs, rest[0] if rest else default_timeout
+
+
+def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     """Gevent-based worker with greenlet concurrency."""
     import gevent
     import gevent.lock
@@ -46,13 +62,13 @@ def gevent_worker(
     ctx = zmq_green.Context()
     sock = ctx.socket(zmq_green.ROUTER)
     sock.setsockopt(zmq.LINGER, 0)
-    sock.bind(ipc_addr)
+    sock.bind(cfg.ipc_addr)
 
-    factory = dill.loads(factory_bytes)
+    factory = dill.loads(cfg.factory_bytes)
     client = None
     client_lock = gevent.lock.RLock()
     send_lock = gevent.lock.Semaphore()
-    group = gevent.pool.Group()
+    pool = gevent.pool.Pool(cfg.max_concurrency) if cfg.max_concurrency else gevent.pool.Group()
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = _safe_dumps(data, ok)
@@ -62,7 +78,10 @@ def gevent_worker(
                     [identity, req_id, _OK if ok else _ERR, resp]
                 )
 
-    def handle(identity: bytes, req_id: bytes, method: str, args: tuple, kwargs: dict):
+    def handle(
+        identity: bytes, req_id: bytes, method: str, args: tuple, kwargs: dict,
+        timeout: float,
+    ):
         nonlocal client
         try:
             with gevent.Timeout(timeout, TimeoutError(f"{method} timed out")):
@@ -86,11 +105,11 @@ def gevent_worker(
             if payload == _SHUTDOWN:
                 return False
             try:
-                method, args, kwargs = SmartPickle.loads(payload)
+                method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
             except Exception:
                 send(identity, req_id, False, ValueError("malformed request"))
                 continue
-            group.spawn(handle, identity, req_id, method, args, kwargs)
+            pool.spawn(handle, identity, req_id, method, args, kwargs, timeout)
 
     try:
         while True:
@@ -99,22 +118,25 @@ def gevent_worker(
     except zmq.ZMQError:
         pass
     finally:
-        group.join(timeout=6)
+        pool.join(timeout=6)
         safe_close(client)
         sock.close(linger=0)
         ctx.term()
 
 
-def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
+def asyncio_worker(cfg: WorkerConfig):
     """Asyncio-based worker for async clients."""
     import asyncio
     import inspect
 
     import zmq.asyncio
 
-    factory = dill.loads(factory_bytes)
+    factory = dill.loads(cfg.factory_bytes)
     client = None
     lock = asyncio.Lock()
+    sem: asyncio.Semaphore | None = (
+        asyncio.Semaphore(cfg.max_concurrency) if cfg.max_concurrency else None
+    )
     tasks: set[asyncio.Task] = set()
 
     async def get_client():
@@ -135,6 +157,16 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
                 [identity, req_id, _OK if ok else _ERR, resp]
             )
 
+    async def _call(method: str, args: tuple, kwargs: dict, timeout: float):
+        c = await get_client()
+        fn = getattr(c, method)
+        if inspect.iscoroutinefunction(fn):
+            return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: fn(*args, **kwargs)), timeout
+        )
+
     async def handle(
         sock,
         identity: bytes,
@@ -142,19 +174,13 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
         method: str,
         args: tuple,
         kwargs: dict,
+        timeout: float,
     ):
         ok, result = False, None
         try:
-            c = await get_client()
-            fn = getattr(c, method)
-            if inspect.iscoroutinefunction(fn):
-                result = await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)
-            else:
-                loop = asyncio.get_running_loop()
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: fn(*args, **kwargs)), timeout
-                )
-            ok = True
+            async with sem if sem else contextlib.nullcontext():
+                result = await _call(method, args, kwargs, timeout)
+                ok = True
         except asyncio.TimeoutError:
             result = TimeoutError(f"{method} timed out")
         except Exception as e:
@@ -170,7 +196,7 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
         ctx = zmq.asyncio.Context()
         sock = ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 0)
-        sock.bind(ipc_addr)
+        sock.bind(cfg.ipc_addr)
         poller = zmq.asyncio.Poller()
         poller.register(sock, zmq.POLLIN)
 
@@ -185,12 +211,12 @@ def asyncio_worker(ipc_addr: str, factory_bytes: bytes, timeout: float):
                 if payload == _SHUTDOWN:
                     break
                 try:
-                    method, args, kwargs = SmartPickle.loads(payload)
+                    method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
                 except Exception:
                     await send(sock, identity, req_id, False, ValueError("malformed request"))
                     continue
                 task = asyncio.create_task(
-                    handle(sock, identity, req_id, method, args, kwargs)
+                    handle(sock, identity, req_id, method, args, kwargs, timeout)
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
