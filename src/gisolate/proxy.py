@@ -20,7 +20,8 @@ import zmq
 
 from . import _internal, hub
 from ._internal import ProcessError, SmartPickle
-from ._workers import _OK, _SHUTDOWN, asyncio_worker, gevent_worker
+from ._workers import (_OK, _SHUTDOWN, WorkerConfig, asyncio_worker,
+                       gevent_worker)
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -78,6 +79,7 @@ class ProcessProxy(abc.ABC):
     mp_context: Any = None
     patch_kwargs: dict | None = None
     timeout: float = 24
+    max_concurrency: int | None = None
 
     @staticmethod
     @abc.abstractmethod
@@ -131,12 +133,16 @@ class ProcessProxy(abc.ABC):
             self._sock.setsockopt(zmq.LINGER, 0)
             self._sock.connect(self._addr)
 
-            factory_bytes = dill.dumps(cls.client_factory)
-            base_args = (self._addr, factory_bytes, cls.timeout)
+            config = WorkerConfig(
+                ipc_addr=self._addr,
+                factory_bytes=dill.dumps(cls.client_factory),
+                timeout=cls.timeout,
+                max_concurrency=cls.max_concurrency,
+            )
             worker, args = (
-                (gevent_worker, (*base_args, cls.patch_kwargs))
+                (gevent_worker, (config, cls.patch_kwargs))
                 if cls.patch_kwargs is not None
-                else (asyncio_worker, base_args)
+                else (asyncio_worker, (config,))
             )
 
             mp_ctx = self._get_mp_context()
@@ -296,6 +302,11 @@ class ProcessProxy(abc.ABC):
 
     def execute(self, method: str, *args, **kwargs) -> Any:
         """Send method call to child process and wait for response. Thread-safe."""
+        return self._execute(method, args, kwargs, self.timeout)
+
+    def _execute(
+        self, method: str, args: tuple, kwargs: dict, rpc_timeout: float
+    ) -> Any:
         self._ensure_running()
 
         req_id = next(self._counter) & 0xFFFFFFFF
@@ -308,18 +319,22 @@ class ProcessProxy(abc.ABC):
             self._pending[req_id] = ar
 
         try:
-            if err := self._send(req_id, method, args, kwargs):
+            if err := self._send(req_id, method, args, kwargs, rpc_timeout):
                 if isinstance(err, ProcessError):
                     raise err
                 self.restart_process()
                 raise ProcessError("Failed to send request to child") from err
 
-            result = ar.get(timeout=self.timeout + max(2.0, self.timeout * 0.1))
+            result = ar.get(
+                timeout=rpc_timeout + max(2.0, rpc_timeout * 0.1)
+            )
             with self._lock:
                 self._error_count = 0
             return result
         except gevent.Timeout:
-            raise TimeoutError(f"{method} timed out after {self.timeout}s") from None
+            raise TimeoutError(
+                f"{method} timed out after {rpc_timeout}s"
+            ) from None
         except ProcessError:
             with self._lock:
                 self._error_count += 1
@@ -333,10 +348,11 @@ class ProcessProxy(abc.ABC):
                 self._pending.pop(req_id, None)
 
     def _send(
-        self, req_id: int, method: str, args: tuple, kwargs: dict
+        self, req_id: int, method: str, args: tuple, kwargs: dict,
+        rpc_timeout: float,
     ) -> Exception | None:
         try:
-            payload = SmartPickle.dumps((method, args, kwargs))
+            payload = SmartPickle.dumps((method, args, kwargs, rpc_timeout))
             with self._lock:
                 self._sock.send_multipart([_pack_id(req_id), payload], zmq.NOBLOCK)
             return None
@@ -352,6 +368,13 @@ class ProcessProxy(abc.ABC):
             if self._sock is None:
                 raise ProcessError("Process not running")
 
+    def with_timeout(self, timeout: float) -> "_TimeoutView":
+        """Return a view that uses the given timeout for all calls.
+
+        Usage: proxy.with_timeout(60).slow_method(args)
+        """
+        return _TimeoutView(self, timeout)
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
@@ -363,6 +386,7 @@ class ProcessProxy(abc.ABC):
         factory: Callable[[], T],
         *,
         timeout: float = 24,
+        max_concurrency: int | None = None,
         mp_context: Any = None,
         patch_kwargs: dict | None = None,
     ) -> T:  # type: ignore[misc]
@@ -378,8 +402,25 @@ class ProcessProxy(abc.ABC):
             "client_factory": staticmethod(factory),
             "timeout": timeout,
             "patch_kwargs": patch_kwargs,
+            "max_concurrency": max_concurrency,
         }
         if mp_context is not None:
             ns["mp_context"] = mp_context
         klass = type(f"ProcessProxy<{factory.__qualname__}>", (cls,), ns)
         return klass()  # type: ignore[return-value]
+
+
+class _TimeoutView:
+    """Lightweight view that forwards calls with a custom timeout."""
+
+    __slots__ = ("_proxy", "_timeout")
+
+    def __init__(self, proxy: ProcessProxy, timeout: float):
+        self._proxy = proxy
+        self._timeout = timeout
+
+    def __getattr__(self, name: str):
+        def proxy_method(*args, **kwargs):
+            return self._proxy._execute(name, args, kwargs, self._timeout)
+
+        return proxy_method
