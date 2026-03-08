@@ -74,13 +74,11 @@ class SmartPickle:
 
 
 def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:
-    """Ensure exception survives serialization, attach remote traceback."""
-    for serializer in (pickle, dill):
-        with contextlib.suppress(Exception):
-            serializer.dumps(e)
-            exc = e
-            break
-    else:
+    """Ensure exception survives serialization round-trip, attach remote traceback."""
+    try:
+        SmartPickle.loads(SmartPickle.dumps(e))
+        exc = e
+    except Exception:
         exc = RemoteError(f"{type(e).__name__}: {e}", type(e).__name__)
     if tb_str:
         with contextlib.suppress(AttributeError):

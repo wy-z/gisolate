@@ -4,20 +4,9 @@ import pickle
 
 import dill
 import pytest
-
-from gisolate._internal import (
-    Event,
-    Local,
-    ProcessError,
-    Queue,
-    QueueEmpty,
-    RLock,
-    RemoteError,
-    SmartPickle,
-    current_thread,
-    wrap_exception,
-)
-
+from gisolate._internal import (Event, Local, ProcessError, Queue, QueueEmpty,
+                                RemoteError, RLock, SmartPickle,
+                                current_thread, wrap_exception)
 
 # ---------------------------------------------------------------------------
 # Unpatched primitives
@@ -162,3 +151,17 @@ class TestWrapException:
         original = ValueError(lambda: 42)
         wrapped = wrap_exception(original)
         assert wrapped is original
+
+    def test_dumps_ok_but_loads_fails_becomes_remote_error(self):
+        """Exceptions that pickle-dump but fail to load become RemoteError."""
+
+        class BadLoadError(Exception):
+            def __init__(self, msg: str, *, required_kwarg: object):
+                self.required_kwarg = required_kwarg
+                super().__init__(msg)
+
+        original = BadLoadError("boom", required_kwarg="val")
+        wrapped = wrap_exception(original)
+        assert isinstance(wrapped, RemoteError)
+        assert "BadLoadError" in str(wrapped)
+        assert wrapped.exc_type == "BadLoadError"
