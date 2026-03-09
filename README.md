@@ -125,9 +125,10 @@ proxy = ProcessProxy.create(factory, patch_kwargs={"thread": False, "os": False}
 
 Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 
-### `ProcessBridge(address, mode=None)`
+### `ProcessBridge(address, mode)`
 
-- **`bridge.address`** — IPC address (starts server if needed)
+- **`bridge.start()`** — start the bridge (idempotent, returns self)
+- **`bridge.address`** — IPC address
 - **`await bridge.call(func, *args, timeout=60, **kwargs)`** — async RPC call (client mode)
 - **`bridge.close()`** — cleanup resources
 

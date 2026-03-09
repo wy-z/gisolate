@@ -13,30 +13,36 @@ def _make_addr():
 
 
 class TestProcessBridgeServer:
-    def test_server_starts_on_address_access(self):
+    def test_start_server(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr)
-        assert bridge.address == addr
+        bridge = ProcessBridge(addr, mode="server")
+        assert bridge.start() is bridge  # returns self for chaining
         bridge.close()
 
     def test_explicit_server_mode(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server")
+        bridge = ProcessBridge(addr, mode="server").start()
         assert bridge.address == addr
         bridge.close()
 
-    def test_client_mode_cannot_access_address(self):
+    def test_address_is_plain_property(self):
         addr = _make_addr()
         bridge = ProcessBridge(addr, mode="client")
-        with pytest.raises(RuntimeError, match="client mode"):
-            _ = bridge.address
+        assert bridge.address == addr  # no side effects
         bridge.close()
 
     def test_close_idempotent_before_start(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr)
+        bridge = ProcessBridge(addr, mode="server")
         bridge.close()  # never started, should not raise
         bridge.close()  # double close, should not raise
+
+    def test_start_idempotent(self):
+        addr = _make_addr()
+        bridge = ProcessBridge(addr, mode="server")
+        bridge.start()
+        bridge.start()  # second start is no-op
+        bridge.close()
 
     def test_server_mode_cannot_call(self):
         addr = _make_addr()
@@ -58,7 +64,7 @@ class TestProcessBridgeRPC:
         """Server handles a function call from an asyncio client."""
         addr = _make_addr()
         server = ProcessBridge(addr, mode="server")
-        _ = server.address  # start server
+        server.start()
 
         import asyncio
 
@@ -77,7 +83,7 @@ class TestProcessBridgeRPC:
     def test_server_client_exception(self):
         addr = _make_addr()
         server = ProcessBridge(addr, mode="server")
-        _ = server.address
+        server.start()
 
         import asyncio
 
@@ -100,7 +106,7 @@ class TestProcessBridgeRPC:
     def test_multiple_calls(self):
         addr = _make_addr()
         server = ProcessBridge(addr, mode="server")
-        _ = server.address
+        server.start()
 
         import asyncio
 
@@ -123,7 +129,7 @@ class TestProcessBridgeRPC:
         """Client survives across separate asyncio.run() calls (reader task revival)."""
         addr = _make_addr()
         server = ProcessBridge(addr, mode="server")
-        _ = server.address
+        server.start()
 
         import asyncio
 
