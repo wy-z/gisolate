@@ -22,10 +22,12 @@ class ProcessBridge:
 
     Args:
         address: IPC address (e.g., "ipc:///tmp/rpc.sock").
-        mode: "server" or "client". If None, auto-detects based on usage.
+        mode: "server" or "client".
     """
 
-    def __init__(self, address: str, mode: str | None = None):
+    def __init__(self, address: str, mode: str):
+        if mode not in ("server", "client"):
+            raise ValueError(f"mode must be 'server' or 'client', got {mode!r}")
         self._addr = address
         self._init_mode = mode
         self._mode: str | None = None
@@ -41,12 +43,18 @@ class ProcessBridge:
 
     @property
     def address(self) -> str:
-        """IPC address. Accessing this starts server if mode allows."""
-        if not self._mode:
-            if self._init_mode == "client":
-                raise RuntimeError("Cannot access address in client mode")
-            self._start_server()
+        """IPC address."""
         return self._addr
+
+    def start(self) -> "ProcessBridge":
+        """Start the bridge. Idempotent. Returns self for chaining."""
+        if self._mode:
+            return self
+        if self._init_mode == "client":
+            self._start_client()
+        else:
+            self._start_server()
+        return self
 
     async def call(self, func: Callable, *args, timeout: float = 60.0, **kwargs) -> Any:
         """Execute func on server. Starts client connection if needed.
@@ -55,7 +63,7 @@ class ProcessBridge:
         """
         import asyncio
 
-        if self._mode == "server" or self._init_mode == "server":
+        if self._init_mode == "server":
             raise RuntimeError("Cannot call() in server mode")
         if not self._mode:
             self._start_client()
