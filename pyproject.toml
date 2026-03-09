@@ -1,6 +1,6 @@
 [project]
 name = "gisolate"
-version = "0.2.1"
+version = "0.2.2"
 description = "Process isolation for gevent applications — run any object in a clean subprocess, call methods transparently via ZMQ IPC."
 readme = "README.md"
 license = "MIT"
