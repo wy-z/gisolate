@@ -68,14 +68,14 @@ ZMQ-based RPC bridge for server/client architectures. Server side uses gevent, c
 from gisolate import ProcessBridge
 
 # Server (gevent side)
-server = ProcessBridge("ipc:///tmp/rpc.sock", mode="server")
-_ = server.address  # starts listening
+server = ProcessBridge("ipc:///tmp/rpc.sock", mode=ProcessBridge.Mode.SERVER)
+server.start()
 
 # Client (asyncio side)
 import asyncio
 
 async def main():
-    client = ProcessBridge("ipc:///tmp/rpc.sock", mode="client")
+    client = ProcessBridge("ipc:///tmp/rpc.sock", mode=ProcessBridge.Mode.CLIENT)
     result = await client.call(lambda x, y: x + y, 3, 4, timeout=5)
     print(result)  # 7
     client.close()

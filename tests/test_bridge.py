@@ -15,38 +15,38 @@ def _make_addr():
 class TestProcessBridgeServer:
     def test_start_server(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server")
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         assert bridge.start() is bridge  # returns self for chaining
         bridge.close()
 
     def test_explicit_server_mode(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server").start()
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER).start()
         assert bridge.address == addr
         bridge.close()
 
     def test_address_is_plain_property(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="client")
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
         assert bridge.address == addr  # no side effects
         bridge.close()
 
     def test_close_idempotent_before_start(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server")
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         bridge.close()  # never started, should not raise
         bridge.close()  # double close, should not raise
 
     def test_start_idempotent(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server")
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         bridge.start()
         bridge.start()  # second start is no-op
         bridge.close()
 
     def test_server_mode_cannot_call(self):
         addr = _make_addr()
-        bridge = ProcessBridge(addr, mode="server")
+        bridge = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
 
         async def try_call():
             await bridge.call(lambda: 42)
@@ -63,13 +63,13 @@ class TestProcessBridgeRPC:
     def test_server_client_roundtrip(self):
         """Server handles a function call from an asyncio client."""
         addr = _make_addr()
-        server = ProcessBridge(addr, mode="server")
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         server.start()
 
         import asyncio
 
         async def client_call():
-            client = ProcessBridge(addr, mode="client")
+            client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
             try:
                 result = await client.call(lambda x, y: x * y, 6, 7, timeout=5)
                 return result
@@ -82,13 +82,13 @@ class TestProcessBridgeRPC:
 
     def test_server_client_exception(self):
         addr = _make_addr()
-        server = ProcessBridge(addr, mode="server")
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         server.start()
 
         import asyncio
 
         async def client_call():
-            client = ProcessBridge(addr, mode="client")
+            client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
             try:
 
                 def fail():
@@ -105,13 +105,13 @@ class TestProcessBridgeRPC:
 
     def test_multiple_calls(self):
         addr = _make_addr()
-        server = ProcessBridge(addr, mode="server")
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         server.start()
 
         import asyncio
 
         async def client_calls():
-            client = ProcessBridge(addr, mode="client")
+            client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
             try:
                 results = []
                 for i in range(5):
@@ -128,12 +128,12 @@ class TestProcessBridgeRPC:
     def test_multiple_asyncio_run_calls(self):
         """Client survives across separate asyncio.run() calls (reader task revival)."""
         addr = _make_addr()
-        server = ProcessBridge(addr, mode="server")
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER)
         server.start()
 
         import asyncio
 
-        client = ProcessBridge(addr, mode="client")
+        client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
         for i in range(3):
             result = asyncio.run(client.call(lambda x: x * 2, i, timeout=5))
             assert result == i * 2

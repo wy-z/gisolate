@@ -1,6 +1,7 @@
 """ProcessBridge: ZMQ-based RPC bridge for cross-process function calls."""
 
 import contextlib
+import enum
 import itertools
 import logging
 import os
@@ -22,15 +23,17 @@ class ProcessBridge:
 
     Args:
         address: IPC address (e.g., "ipc:///tmp/rpc.sock").
-        mode: "server" or "client".
+        mode: ProcessBridge.Mode.SERVER or ProcessBridge.Mode.CLIENT.
     """
 
-    def __init__(self, address: str, mode: str):
-        if mode not in ("server", "client"):
-            raise ValueError(f"mode must be 'server' or 'client', got {mode!r}")
+    class Mode(enum.StrEnum):
+        SERVER = "server"
+        CLIENT = "client"
+
+    def __init__(self, address: str, mode: "ProcessBridge.Mode"):
         self._addr = address
         self._init_mode = mode
-        self._mode: str | None = None
+        self._mode: ProcessBridge.Mode | None = None
         self._req_id = itertools.count()
         self._pending: dict[bytes, Any] = {}
         self._reader_task: Any = None
@@ -50,7 +53,7 @@ class ProcessBridge:
         """Start the bridge. Idempotent. Returns self for chaining."""
         if self._mode:
             return self
-        if self._init_mode == "client":
+        if self._init_mode is ProcessBridge.Mode.CLIENT:
             self._start_client()
         else:
             self._start_server()
@@ -63,7 +66,7 @@ class ProcessBridge:
         """
         import asyncio
 
-        if self._init_mode == "server":
+        if self._init_mode is ProcessBridge.Mode.SERVER:
             raise RuntimeError("Cannot call() in server mode")
         if not self._mode:
             self._start_client()
@@ -119,7 +122,7 @@ class ProcessBridge:
         """Initialize server (gevent ROUTER socket)."""
         import zmq.green as zmq_mod
 
-        self._mode = "server"
+        self._mode = ProcessBridge.Mode.SERVER
         self._shutdown = False
         self._ctx = zmq_mod.Context()
         self._sock = self._ctx.socket(zmq_mod.ROUTER)
@@ -133,7 +136,7 @@ class ProcessBridge:
 
         import zmq.asyncio
 
-        self._mode = "client"
+        self._mode = ProcessBridge.Mode.CLIENT
         self._ctx = zmq.asyncio.Context()
         self._sock = self._ctx.socket(zmq.DEALER)
         self._sock.setsockopt(zmq.LINGER, 0)
@@ -197,7 +200,7 @@ class ProcessBridge:
                 fut.set_exception(err)
         self._pending.clear()
 
-        if self._mode == "server":
+        if self._mode is ProcessBridge.Mode.SERVER:
             self._shutdown = True
             # Wait for _serve greenlet to exit before closing socket
             if self._server_greenlet is not None:
