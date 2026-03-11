@@ -156,6 +156,24 @@ Explicitly stop the internal gevent hub loop. Registered via `atexit` automatica
 
 Configure the default `multiprocessing` context for all proxies (default: `"spawn"`).
 
+## Note on `multiprocessing` and `__main__`
+
+`multiprocessing` spawn/forkserver children re-import the caller's `__main__` module. If your `main.py` has top-level side effects (e.g. `gevent.monkey.patch_all()`), these will re-execute in the child — causing double-patching warnings or import errors.
+
+**Best practice**: guard monkey-patching behind `__name__` and defer heavy imports:
+
+```python
+# main.py
+if __name__ == "__main__":
+    import gevent.monkey
+    gevent.monkey.patch_all()
+
+    import my_app
+    my_app.run()
+```
+
+Spawn children re-import `main.py` but skip the `__name__` block, avoiding side effects.
+
 ## License
 
 MIT
