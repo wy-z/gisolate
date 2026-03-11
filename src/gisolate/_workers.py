@@ -5,9 +5,6 @@ import dataclasses
 import traceback
 from typing import Any
 
-import dill
-import zmq
-
 from ._internal import SmartPickle, wrap_exception
 
 
@@ -50,13 +47,18 @@ def _unpack(payload: bytes, default_timeout: float) -> tuple[str, tuple, dict, f
 
 def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     """Gevent-based worker with greenlet concurrency."""
-    import gevent
-    import gevent.lock
     import gevent.monkey
-    import gevent.pool
-    import zmq.green as zmq_green
 
     gevent.monkey.patch_all(**patch_kwargs)
+
+    # imported after patch_all so they pick up patched stdlib
+    import dill
+    import gevent
+    import gevent.lock
+    import gevent.pool
+    import zmq
+    import zmq.green as zmq_green
+
     gevent.get_hub()
 
     ctx = zmq_green.Context()
@@ -68,18 +70,24 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     client = None
     client_lock = gevent.lock.RLock()
     send_lock = gevent.lock.Semaphore()
-    pool = gevent.pool.Pool(cfg.max_concurrency) if cfg.max_concurrency else gevent.pool.Group()
+    pool = (
+        gevent.pool.Pool(cfg.max_concurrency)
+        if cfg.max_concurrency
+        else gevent.pool.Group()
+    )
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = _safe_dumps(data, ok)
         with send_lock:
             with contextlib.suppress(zmq.ZMQError):
-                sock.send_multipart(
-                    [identity, req_id, _OK if ok else _ERR, resp]
-                )
+                sock.send_multipart([identity, req_id, _OK if ok else _ERR, resp])
 
     def handle(
-        identity: bytes, req_id: bytes, method: str, args: tuple, kwargs: dict,
+        identity: bytes,
+        req_id: bytes,
+        method: str,
+        args: tuple,
+        kwargs: dict,
         timeout: float,
     ):
         nonlocal client
@@ -129,6 +137,8 @@ def asyncio_worker(cfg: WorkerConfig):
     import asyncio
     import inspect
 
+    import dill
+    import zmq
     import zmq.asyncio
 
     factory = dill.loads(cfg.factory_bytes)
@@ -153,9 +163,7 @@ def asyncio_worker(cfg: WorkerConfig):
     async def send(sock, identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = _safe_dumps(data, ok)
         with contextlib.suppress(zmq.ZMQError):
-            await sock.send_multipart(
-                [identity, req_id, _OK if ok else _ERR, resp]
-            )
+            await sock.send_multipart([identity, req_id, _OK if ok else _ERR, resp])
 
     async def _call(method: str, args: tuple, kwargs: dict, timeout: float):
         c = await get_client()
@@ -213,7 +221,9 @@ def asyncio_worker(cfg: WorkerConfig):
                 try:
                     method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
                 except Exception:
-                    await send(sock, identity, req_id, False, ValueError("malformed request"))
+                    await send(
+                        sock, identity, req_id, False, ValueError("malformed request")
+                    )
                     continue
                 task = asyncio.create_task(
                     handle(sock, identity, req_id, method, args, kwargs, timeout)
