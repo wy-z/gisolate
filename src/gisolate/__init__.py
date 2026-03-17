@@ -6,8 +6,7 @@ Isolates libraries incompatible with gevent monkey-patching.
 
 from ._internal import ProcessError, RemoteError
 from .bridge import ProcessBridge
-from .hub import shutdown as shutdown_hub
-from .hub import spawn_on_main_hub
+from .hub import ensure_hub_started, shutdown as shutdown_hub, spawn_on_main_hub
 from .local import ThreadLocalProxy
 from .proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 from .subprocess import run_in_subprocess
@@ -27,6 +26,7 @@ __all__ = [
     "ProcessProxy",
     "RemoteError",
     "ThreadLocalProxy",
+    "ensure_hub_started",
     "get_default_mp_context",
     "run_in_subprocess",
     "set_default_mp_context",

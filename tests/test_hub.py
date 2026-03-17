@@ -2,7 +2,7 @@
 
 import gevent
 import pytest
-from gisolate.hub import (AsyncResult, ensure_started, run_on_main_hub,
+from gisolate.hub import (AsyncResult, ensure_hub_started, run_on_main_hub,
                           spawn_on_main_hub)
 
 
@@ -30,9 +30,9 @@ class TestAsyncResult:
 
 
 class TestMainHub:
-    def test_ensure_started_idempotent(self):
-        ensure_started()
-        ensure_started()
+    def test_ensure_hub_started_idempotent(self):
+        ensure_hub_started()
+        ensure_hub_started()
 
     def test_run_on_main_hub_executes_func(self):
         """run_on_main_hub runs the function and waits (returns None on success)."""

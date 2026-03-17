@@ -136,6 +136,10 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 
 Transparent proxy delegating attribute access to a per-thread instance.
 
+### `ensure_hub_started()`
+
+Pre-start the internal gevent hub loop on demand. Idempotent and thread-safe. Called automatically by `ProcessProxy`, but can be invoked explicitly to control initialization timing.
+
 ### `spawn_on_main_hub(func, *args, **kwargs)`
 
 Schedule a function on the main gevent hub without waiting. Thread-safe, fire-and-forget.
