@@ -74,7 +74,7 @@ def _loop():
                 result.set_exception(e)
 
 
-def ensure_started() -> None:
+def ensure_hub_started() -> None:
     """Lazily start the main hub loop. Thread-safe.
 
     Must be called from the main thread on first invocation so that
@@ -152,7 +152,7 @@ atexit.register(shutdown)
 
 def run_on_main_hub(func: Callable) -> Any:
     """Run function on main hub and wait for result. Thread-safe."""
-    ensure_started()
+    ensure_hub_started()
     with _lock:
         if _stopping:
             raise RuntimeError("Hub is shutting down")
@@ -163,7 +163,7 @@ def run_on_main_hub(func: Callable) -> Any:
 
 def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
     """Schedule function on main hub without waiting. Thread-safe, fire-and-forget."""
-    ensure_started()
+    ensure_hub_started()
     with _lock:
         if _stopping:
             return

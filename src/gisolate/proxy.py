@@ -106,7 +106,7 @@ class ProcessProxy(abc.ABC):
         self._sock: Any = None
         self._addr: str | None = None
         self._owner = _internal.current_thread()
-        hub.ensure_started()
+        hub.ensure_hub_started()
         self._start()
 
     # --- Lifecycle ---
