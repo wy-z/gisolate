@@ -1,6 +1,9 @@
 """Tests for gisolate.subprocess module."""
 
 import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -32,3 +35,30 @@ class TestRunInSubprocess:
     def test_returns_none(self):
         assert run_in_subprocess(noop) is None
 
+    def test_make_pipe_forces_blocking_with_gevent_patch(self):
+        script = textwrap.dedent(
+            """
+            import multiprocessing
+            import os
+
+            from gevent import monkey
+
+            monkey.patch_all()
+
+            from gisolate.subprocess import _make_pipe
+
+            parent_conn, child_conn = _make_pipe(multiprocessing.get_context("spawn"))
+            for conn in (parent_conn, child_conn):
+                print(os.get_blocking(conn.fileno()))
+                conn.close()
+            """
+        )
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert proc.stdout.strip().splitlines() == ["True", "True"]
