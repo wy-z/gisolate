@@ -1,6 +1,7 @@
 """Run a function in an isolated subprocess with gevent-safe polling."""
 
 import logging
+import os
 import time
 from typing import Any, Callable
 
@@ -11,6 +12,20 @@ from .proxy import get_default_mp_context
 log = logging.getLogger(__name__)
 
 _EMPTY = object()
+
+
+def _make_pipe(mp: Any) -> tuple[Any, Any]:
+    """Create a Pipe with blocking fd semantics.
+
+    gevent's socket monkey patch can leave ``multiprocessing.Pipe()`` backed by
+    non-blocking ``socketpair()`` fds. ``Connection.send_bytes()`` expects a
+    blocking fd and may raise ``BlockingIOError`` under load if ``O_NONBLOCK``
+    leaks through.
+    """
+    parent_conn, child_conn = mp.Pipe()
+    for conn in (parent_conn, child_conn):
+        os.set_blocking(conn.fileno(), True)
+    return parent_conn, child_conn
 
 
 def _worker(conn: Any, fn: Callable, fn_args: tuple, fn_kwargs: dict) -> None:
@@ -55,7 +70,7 @@ def run_in_subprocess(
         Exception: Any exception raised by target function.
     """
     mp = mp_context or get_default_mp_context()
-    parent_conn, child_conn = mp.Pipe()
+    parent_conn, child_conn = _make_pipe(mp)
     proc = mp.Process(
         target=_worker,
         args=(child_conn, target, args, kwargs or {}),
