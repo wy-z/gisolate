@@ -2,11 +2,14 @@
 
 import contextlib
 import io
+import logging
 import pickle
 from typing import Any
 
 import dill
 import gevent.monkey
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Unpatched stdlib primitives
@@ -71,6 +74,39 @@ class SmartPickle:
         if tag == cls._PICKLE:
             return pickle.loads(mv[1:])
         return dill.loads(bytes(mv[1:]))
+
+
+@contextlib.contextmanager
+def suppress_main_reimport():
+    """Prevent child process from reimporting the caller's __main__ module.
+
+    multiprocessing's spawn/forkserver contexts reimport __main__ in child
+    processes via ``get_preparation_data``. Since gisolate workers live in
+    their own modules, this reimport is unnecessary and causes errors
+    (duplicate patches, side effects from re-executing main-module code).
+    """
+    import multiprocessing.spawn as mp_spawn
+
+    orig = getattr(mp_spawn, "get_preparation_data", None)
+    if orig is None:
+        log.warning(
+            "multiprocessing.spawn.get_preparation_data not found, "
+            "cannot suppress __main__ reimport"
+        )
+        yield
+        return
+
+    def _stripped(name):
+        d = orig(name)
+        d.pop("init_main_from_path", None)
+        d.pop("init_main_from_name", None)
+        return d
+
+    mp_spawn.get_preparation_data = _stripped  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        mp_spawn.get_preparation_data = orig  # type: ignore[assignment]
 
 
 def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:

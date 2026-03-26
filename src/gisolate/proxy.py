@@ -147,7 +147,8 @@ class ProcessProxy(abc.ABC):
 
             mp_ctx = self._get_mp_context()
             self._process = mp_ctx.Process(target=worker, daemon=True, args=args)
-            self._process.start()
+            with _internal.suppress_main_reimport():
+                self._process.start()
             log.info(f"ProcessProxy started: pid={self._process.pid}, ctx={mp_ctx}")
             self._alive = True
             self._reader = gevent.spawn(self._read_loop)
@@ -325,16 +326,12 @@ class ProcessProxy(abc.ABC):
                 self.restart_process()
                 raise ProcessError("Failed to send request to child") from err
 
-            result = ar.get(
-                timeout=rpc_timeout + max(2.0, rpc_timeout * 0.1)
-            )
+            result = ar.get(timeout=rpc_timeout + max(2.0, rpc_timeout * 0.1))
             with self._lock:
                 self._error_count = 0
             return result
         except gevent.Timeout:
-            raise TimeoutError(
-                f"{method} timed out after {rpc_timeout}s"
-            ) from None
+            raise TimeoutError(f"{method} timed out after {rpc_timeout}s") from None
         except ProcessError:
             with self._lock:
                 self._error_count += 1
@@ -348,7 +345,11 @@ class ProcessProxy(abc.ABC):
                 self._pending.pop(req_id, None)
 
     def _send(
-        self, req_id: int, method: str, args: tuple, kwargs: dict,
+        self,
+        req_id: int,
+        method: str,
+        args: tuple,
+        kwargs: dict,
         rpc_timeout: float,
     ) -> Exception | None:
         try:

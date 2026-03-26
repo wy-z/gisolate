@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import gevent
 
+from ._internal import suppress_main_reimport
 from .proxy import get_default_mp_context
 
 log = logging.getLogger(__name__)
@@ -37,7 +38,9 @@ def _worker(conn: Any, fn: Callable, fn_args: tuple, fn_kwargs: dict) -> None:
     except Exception as e:
         import traceback
 
-        conn.send_bytes(SmartPickle.dumps(("error", wrap_exception(e, traceback.format_exc()))))
+        conn.send_bytes(
+            SmartPickle.dumps(("error", wrap_exception(e, traceback.format_exc())))
+        )
     finally:
         conn.close()
 
@@ -76,7 +79,8 @@ def run_in_subprocess(
         args=(child_conn, target, args, kwargs or {}),
         daemon=False,
     )
-    proc.start()
+    with suppress_main_reimport():
+        proc.start()
     child_conn.close()
 
     def try_recv() -> Any:
