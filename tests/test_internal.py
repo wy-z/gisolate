@@ -6,7 +6,8 @@ import dill
 import pytest
 from gisolate._internal import (Event, Local, ProcessError, Queue, QueueEmpty,
                                 RemoteError, RLock, SmartPickle,
-                                current_thread, wrap_exception)
+                                current_thread, suppress_main_reimport,
+                                wrap_exception)
 
 # ---------------------------------------------------------------------------
 # Unpatched primitives
@@ -165,3 +166,36 @@ class TestWrapException:
         assert isinstance(wrapped, RemoteError)
         assert "BadLoadError" in str(wrapped)
         assert wrapped.exc_type == "BadLoadError"
+
+
+# ---------------------------------------------------------------------------
+# suppress_main_reimport
+# ---------------------------------------------------------------------------
+
+
+class TestSuppressMainReimport:
+    def test_strips_init_keys_from_preparation_data(self):
+        import multiprocessing.spawn as mp_spawn
+
+        orig_fn = mp_spawn.get_preparation_data
+
+        with suppress_main_reimport():
+            patched_data = mp_spawn.get_preparation_data("__main__")
+            assert "init_main_from_name" not in patched_data
+            assert "init_main_from_path" not in patched_data
+
+        # Original function restored by identity
+        assert mp_spawn.get_preparation_data is orig_fn
+
+    def test_strips_init_main_from_path_for_script_mode(self, monkeypatch):
+        """Simulate `python app.py` where __main__ has __file__ but no __spec__."""
+        import multiprocessing.spawn as mp_spawn
+        import sys
+
+        main = sys.modules["__main__"]
+        monkeypatch.setattr(main, "__file__", "/tmp/fake_app.py")
+        monkeypatch.setattr(main, "__spec__", None)
+
+        with suppress_main_reimport():
+            data = mp_spawn.get_preparation_data("__main__")
+            assert "init_main_from_path" not in data
