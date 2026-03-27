@@ -255,16 +255,12 @@ class ProcessProxy(abc.ABC):
         try:
             idle_cycles = 0
             while not self._shutdown:
-                if self._sock.poll(50):
-                    self._drain()
+                if self._sock.poll(50) and self._drain():
                     idle_cycles = 0
                 else:
                     idle_cycles += 1
-                    if (
-                        idle_cycles >= self.ALIVE_CHECK_INTERVAL
-                        and not self._is_alive()
-                    ):
-                        break
+                if idle_cycles >= self.ALIVE_CHECK_INTERVAL and not self._is_alive():
+                    break
             if not self._shutdown:
                 log.warning("Child process died, stopping reader")
         except (gevent.GreenletExit, zmq.ZMQError):
@@ -275,13 +271,15 @@ class ProcessProxy(abc.ABC):
             self._alive = False
             self._stop(ProcessError("Child process disconnected"))
 
-    def _drain(self) -> None:
-        """Receive and dispatch all available responses."""
+    def _drain(self) -> bool:
+        """Receive and dispatch all available responses; return True if any received."""
+        received = False
         while True:
             try:
                 parts = self._sock.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
-                return
+                return received
+            received = True
             if len(parts) < 3:
                 continue
             req_id_bytes, ok_flag, payload = parts[:3]
