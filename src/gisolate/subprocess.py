@@ -53,6 +53,7 @@ def run_in_subprocess(
     timeout: float = 3600,
     mp_context: Any = None,
     poll_interval: float = 0.1,
+    daemon: bool = True,
 ) -> Any:
     """Run target function in subprocess with non-blocking polling (gevent-safe).
 
@@ -77,7 +78,7 @@ def run_in_subprocess(
     proc = mp.Process(
         target=_worker,
         args=(child_conn, target, args, kwargs or {}),
-        daemon=False,
+        daemon=daemon,
     )
     with suppress_main_reimport():
         proc.start()
