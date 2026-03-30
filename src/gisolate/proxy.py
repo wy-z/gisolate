@@ -80,6 +80,7 @@ class ProcessProxy(abc.ABC):
     patch_kwargs: dict | None = None
     timeout: float = 24
     max_concurrency: int | None = None
+    daemon: bool = True
 
     @staticmethod
     @abc.abstractmethod
@@ -146,7 +147,7 @@ class ProcessProxy(abc.ABC):
             )
 
             mp_ctx = self._get_mp_context()
-            self._process = mp_ctx.Process(target=worker, daemon=True, args=args)
+            self._process = mp_ctx.Process(target=worker, daemon=cls.daemon, args=args)
             with _internal.suppress_main_reimport():
                 self._process.start()
             log.info(f"ProcessProxy started: pid={self._process.pid}, ctx={mp_ctx}")
