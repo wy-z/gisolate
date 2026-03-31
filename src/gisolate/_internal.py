@@ -109,6 +109,87 @@ def suppress_main_reimport():
         mp_spawn.get_preparation_data = orig  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# ZMQ helpers
+# ---------------------------------------------------------------------------
+
+
+def patch_zmq_green_poller():
+    """Fix zmq.green._Poller.poll() busy-spin bug.  Idempotent.
+
+    The bug: _Poller.poll(timeout) loops calling super().poll(0) then
+    gevent.select.select() on the ZMQ FD.  When the FD is stuck readable
+    (e.g. dead peer cleanup) the hub short-circuits select in userspace
+    (no syscall) while poll(0) finds no user events, producing a
+    ~300µs/iteration pure-CPU spin visible as endless
+    ``poll(fd, POLLIN, 0) = 0`` in strace with zero select/epoll calls.
+
+    The fix: call getsockopt(EVENTS) on each registered zmq socket before
+    select.select().  This clears FD signaling at the kernel level so
+    select truly blocks.
+    """
+    import gevent
+    from gevent import select
+
+    import zmq
+    from zmq import Poller as _original_Poller
+    from zmq.green.poll import _Poller
+
+    if getattr(_Poller.poll, "_patched", False):
+        return
+
+    def poll(self, timeout=-1):
+        if timeout is None:
+            timeout = -1
+        if timeout < 0:
+            timeout = -1
+
+        if timeout > 0:
+            tout = gevent.Timeout.start_new(timeout / 1000.0)
+        else:
+            tout = None
+
+        try:
+            rlist, wlist, xlist = self._get_descriptors()
+            while True:
+                events = _original_Poller.poll(self, 0)
+                if events or timeout == 0:
+                    return events
+
+                # Clear FD signaling so select.select() truly blocks.
+                for s, _ in self.sockets:
+                    if isinstance(s, zmq.Socket):
+                        s.getsockopt(zmq.EVENTS)
+
+                # Re-check: a real event may have arrived between
+                # the first poll(0) and the EVENTS drain above.
+                events = _original_Poller.poll(self, 0)
+                if events:
+                    return events
+
+                _bug_timeout = gevent.Timeout.start_new(
+                    self._gevent_bug_timeout
+                )
+                try:
+                    select.select(rlist, wlist, xlist)
+                except gevent.Timeout as t:
+                    if t is not _bug_timeout:
+                        raise
+                finally:
+                    _bug_timeout.cancel()
+
+        except gevent.Timeout as t:
+            if t is not tout:
+                raise
+            return []
+        finally:
+            if timeout > 0:
+                tout.cancel()  # type: ignore[union-attr]
+
+    poll._patched = True  # type: ignore[attr-defined]
+    _Poller.poll = poll  # type: ignore[method-assign]
+
+
 def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:
     """Ensure exception survives serialization round-trip, attach remote traceback."""
     try:

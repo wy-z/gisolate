@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import gevent
 
-from ._internal import SmartPickle, wrap_exception
+from ._internal import SmartPickle, patch_zmq_green_poller, wrap_exception
 from ._workers import _ERR, _OK, _SHUTDOWN, _safe_dumps
 
 log = logging.getLogger(__name__)
@@ -120,6 +120,7 @@ class ProcessBridge:
 
     def _start_server(self):
         """Initialize server (gevent ROUTER socket)."""
+        patch_zmq_green_poller()
         import zmq.green as zmq_mod
 
         self._mode = ProcessBridge.Mode.SERVER

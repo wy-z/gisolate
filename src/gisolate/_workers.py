@@ -5,7 +5,7 @@ import dataclasses
 import traceback
 from typing import Any
 
-from ._internal import SmartPickle, wrap_exception
+from ._internal import SmartPickle, patch_zmq_green_poller, wrap_exception
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -57,6 +57,8 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     import gevent.lock
     import gevent.pool
     import zmq
+
+    patch_zmq_green_poller()
     import zmq.green as zmq_green
 
     gevent.get_hub()
