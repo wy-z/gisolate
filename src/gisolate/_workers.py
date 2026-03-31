@@ -5,7 +5,7 @@ import dataclasses
 import traceback
 from typing import Any
 
-from ._internal import SmartPickle, patch_zmq_green_poller, wrap_exception
+from ._internal import SmartPickle, wait_zmq_readable, wrap_exception
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -58,13 +58,10 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     import gevent.pool
     import zmq
 
-    patch_zmq_green_poller()
-    import zmq.green as zmq_green
-
     gevent.get_hub()
 
-    ctx = zmq_green.Context()
-    sock = ctx.socket(zmq_green.ROUTER)
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.ROUTER)
     sock.setsockopt(zmq.LINGER, 0)
     sock.bind(cfg.ipc_addr)
 
@@ -82,7 +79,10 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         resp, ok = _safe_dumps(data, ok)
         with send_lock:
             with contextlib.suppress(zmq.ZMQError):
-                sock.send_multipart([identity, req_id, _OK if ok else _ERR, resp])
+                sock.send_multipart(
+                    [identity, req_id, _OK if ok else _ERR, resp],
+                    flags=zmq.NOBLOCK,
+                )
 
     def handle(
         identity: bytes,
@@ -103,12 +103,17 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
             send(identity, req_id, False, wrap_exception(e, traceback.format_exc()))
 
     def _drain() -> bool:
-        """Drain all available messages. Returns False on shutdown."""
-        while True:
+        """Drain all available messages. Returns False on shutdown.
+
+        Uses getsockopt(EVENTS) to check for POLLIN before each recv,
+        which also clears ZMQ FD signaling so the subsequent IO watcher
+        in wait_zmq_readable() blocks properly.
+        """
+        while sock.getsockopt(zmq.EVENTS) & zmq.POLLIN:  # type: ignore[operator]
             try:
                 parts = sock.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
-                return True
+                break
             if len(parts) < 3:
                 continue
             identity, req_id, payload = parts[:3]
@@ -120,11 +125,13 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
                 send(identity, req_id, False, ValueError("malformed request"))
                 continue
             pool.spawn(handle, identity, req_id, method, args, kwargs, timeout)
+        return True
 
     try:
         while True:
-            if sock.poll(500) and not _drain():
+            if not _drain():
                 break
+            wait_zmq_readable(sock, 0.5)
     except zmq.ZMQError:
         pass
     finally:

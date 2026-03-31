@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import gevent
 
-from ._internal import SmartPickle, patch_zmq_green_poller, wrap_exception
+from ._internal import SmartPickle, wait_zmq_readable, wrap_exception
 from ._workers import _ERR, _OK, _SHUTDOWN, _safe_dumps
 
 log = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ class ProcessBridge:
 
         try:
             while True:
-                parts = await self._sock.recv_multipart()
+                parts = await self._sock.recv_multipart()  # type: ignore[misc]
                 if len(parts) < 3:
                     continue
                 resp_id, status, payload = parts[:3]
@@ -119,15 +119,20 @@ class ProcessBridge:
             self._pending.clear()
 
     def _start_server(self):
-        """Initialize server (gevent ROUTER socket)."""
-        patch_zmq_green_poller()
-        import zmq.green as zmq_mod
+        """Initialize server (raw zmq ROUTER socket — NOT zmq.green).
+
+        Using raw zmq avoids zmq.green's busy-spin bug: its _Poller.poll()
+        spins when the ZMQ FD is stuck readable, and its _Socket's persistent
+        IO watcher interferes with select.select() via cached readiness state.
+        The _serve loop uses a fresh gevent hub IO watcher for each wait.
+        """
+        import zmq
 
         self._mode = ProcessBridge.Mode.SERVER
         self._shutdown = False
-        self._ctx = zmq_mod.Context()
-        self._sock = self._ctx.socket(zmq_mod.ROUTER)
-        self._sock.setsockopt(zmq_mod.LINGER, 0)
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.ROUTER)
+        self._sock.setsockopt(zmq.LINGER, 0)
         self._sock.bind(self._addr)
         self._server_greenlet = gevent.spawn(self._serve)
 
@@ -148,7 +153,7 @@ class ProcessBridge:
         """Server loop: dispatch each request to a greenlet for concurrency."""
         import gevent.lock
         import gevent.pool
-        import zmq.green as zmq_mod
+        import zmq
 
         group = gevent.pool.Group()
         send_lock = gevent.lock.Semaphore()
@@ -165,23 +170,32 @@ class ProcessBridge:
                 ok = False
             resp, ok = _safe_dumps(data, ok)
             with send_lock:
-                with contextlib.suppress(zmq_mod.ZMQError):
+                with contextlib.suppress(zmq.ZMQError):
                     self._sock.send_multipart(
-                        [identity, req_id, _OK if ok else _ERR, resp]
+                        [identity, req_id, _OK if ok else _ERR, resp],
+                        flags=zmq.NOBLOCK,
                     )
 
         try:
             while not self._shutdown:
-                if not self._sock.poll(100):
-                    continue
-                parts: list[bytes] = self._sock.recv_multipart()  # type: ignore[assignment]
-                if len(parts) < 3:
-                    continue
-                identity, req_id, payload = parts[:3]
-                if payload == _SHUTDOWN:
+                while self._sock.getsockopt(zmq.EVENTS) & zmq.POLLIN:  # type: ignore[operator]
+                    try:
+                        parts: list[bytes] = self._sock.recv_multipart(zmq.NOBLOCK)  # type: ignore[assignment]
+                    except zmq.Again:
+                        break
+                    if len(parts) < 3:
+                        continue
+                    identity, req_id, payload = parts[:3]
+                    if payload == _SHUTDOWN:
+                        self._shutdown = True
+                        break
+                    group.spawn(_handle, identity, req_id, payload)
+
+                if self._shutdown:
                     break
-                group.spawn(_handle, identity, req_id, payload)
-        except (gevent.GreenletExit, zmq_mod.ZMQError):
+
+                wait_zmq_readable(self._sock)
+        except (gevent.GreenletExit, zmq.ZMQError):
             pass
         finally:
             group.join(timeout=6)

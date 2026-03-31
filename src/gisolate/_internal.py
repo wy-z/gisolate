@@ -114,80 +114,30 @@ def suppress_main_reimport():
 # ---------------------------------------------------------------------------
 
 
-def patch_zmq_green_poller():
-    """Fix zmq.green._Poller.poll() busy-spin bug.  Idempotent.
+def wait_zmq_readable(sock, timeout: float = 0.5) -> None:
+    """Block current greenlet until ZMQ socket has readable events or timeout.
 
-    The bug: _Poller.poll(timeout) loops calling super().poll(0) then
-    gevent.select.select() on the ZMQ FD.  When the FD is stuck readable
-    (e.g. dead peer cleanup) the hub short-circuits select in userspace
-    (no syscall) while poll(0) finds no user events, producing a
-    ~300µs/iteration pure-CPU spin visible as endless
-    ``poll(fd, POLLIN, 0) = 0`` in strace with zero select/epoll calls.
+    Uses a fresh gevent hub IO watcher on the raw ZMQ FD.  This bypasses
+    zmq.green entirely — its _Poller.poll() busy-spins when the FD is stuck
+    readable (dead peer cleanup), and its _Socket's persistent IO watcher
+    re-signals the FD during hub switches even after getsockopt(EVENTS)
+    clears it.  A fresh watcher checks actual kernel state (epoll), not
+    gevent's cached readiness.
 
-    The fix: call getsockopt(EVENTS) on each registered zmq socket before
-    select.select().  This clears FD signaling at the kernel level so
-    select truly blocks.
+    Callers must drain via getsockopt(EVENTS) before calling this function.
     """
     import gevent
-    from gevent import select
-
+    import gevent.event
     import zmq
-    from zmq import Poller as _original_Poller
-    from zmq.green.poll import _Poller
 
-    if getattr(_Poller.poll, "_patched", False):
-        return
-
-    def poll(self, timeout=-1):
-        if timeout is None:
-            timeout = -1
-        if timeout < 0:
-            timeout = -1
-
-        if timeout > 0:
-            tout = gevent.Timeout.start_new(timeout / 1000.0)
-        else:
-            tout = None
-
-        try:
-            rlist, wlist, xlist = self._get_descriptors()
-            while True:
-                events = _original_Poller.poll(self, 0)
-                if events or timeout == 0:
-                    return events
-
-                # Clear FD signaling so select.select() truly blocks.
-                for s, _ in self.sockets:
-                    if isinstance(s, zmq.Socket):
-                        s.getsockopt(zmq.EVENTS)
-
-                # Re-check: a real event may have arrived between
-                # the first poll(0) and the EVENTS drain above.
-                events = _original_Poller.poll(self, 0)
-                if events:
-                    return events
-
-                _bug_timeout = gevent.Timeout.start_new(
-                    self._gevent_bug_timeout
-                )
-                try:
-                    select.select(rlist, wlist, xlist)
-                except gevent.Timeout as t:
-                    if t is not _bug_timeout:
-                        raise
-                finally:
-                    _bug_timeout.cancel()
-
-        except gevent.Timeout as t:
-            if t is not tout:
-                raise
-            return []
-        finally:
-            if timeout > 0:
-                tout.cancel()  # type: ignore[union-attr]
-
-    poll._patched = True  # type: ignore[attr-defined]
-    _Poller.poll = poll  # type: ignore[method-assign]
+    fd = sock.getsockopt(zmq.FD)
+    evt = gevent.event.Event()
+    watcher = gevent.get_hub().loop.io(fd, 1)
+    watcher.start(evt.set)
+    try:
+        evt.wait(timeout=timeout)
+    finally:
+        watcher.stop()
 
 
 def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:
