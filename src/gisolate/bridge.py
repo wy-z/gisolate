@@ -133,6 +133,7 @@ class ProcessBridge:
         self._ctx = zmq.Context()
         self._sock = self._ctx.socket(zmq.ROUTER)
         self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
         self._sock.bind(self._addr)
         self._server_greenlet = gevent.spawn(self._serve)
 
@@ -170,11 +171,13 @@ class ProcessBridge:
                 ok = False
             resp, ok = _safe_dumps(data, ok)
             with send_lock:
-                with contextlib.suppress(zmq.ZMQError):
+                try:
                     self._sock.send_multipart(
                         [identity, req_id, _OK if ok else _ERR, resp],
                         flags=zmq.NOBLOCK,
                     )
+                except zmq.ZMQError as exc:
+                    log.warning("reply dropped: %s", exc)
 
         try:
             while not self._shutdown:

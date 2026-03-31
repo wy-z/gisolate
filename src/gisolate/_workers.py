@@ -2,8 +2,11 @@
 
 import contextlib
 import dataclasses
+import logging
 import traceback
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from ._internal import SmartPickle, wait_zmq_readable, wrap_exception
 
@@ -63,6 +66,7 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     ctx = zmq.Context()
     sock = ctx.socket(zmq.ROUTER)
     sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
     sock.bind(cfg.ipc_addr)
 
     factory = dill.loads(cfg.factory_bytes)
@@ -78,11 +82,13 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = _safe_dumps(data, ok)
         with send_lock:
-            with contextlib.suppress(zmq.ZMQError):
+            try:
                 sock.send_multipart(
                     [identity, req_id, _OK if ok else _ERR, resp],
                     flags=zmq.NOBLOCK,
                 )
+            except zmq.ZMQError as exc:
+                log.warning("reply dropped: %s", exc)
 
     def handle(
         identity: bytes,
