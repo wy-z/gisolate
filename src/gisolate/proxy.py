@@ -73,14 +73,14 @@ class ProcessProxy(abc.ABC):
         - shutdown(): thread-safe (marshals to main hub if needed)
     """
 
-    AUTO_RESTART_THRESHOLD = 6
-    RESTART_COOLDOWN = 6.0
-    ALIVE_CHECK_INTERVAL = 10
     mp_context: Any = None
     patch_kwargs: dict | None = None
     timeout: float = 24
     max_concurrency: int | None = None
     daemon: bool = True
+    auto_restart_threshold: int = 6
+    restart_cooldown: float = 6.0
+    alive_check_interval: int = 10
 
     @staticmethod
     @abc.abstractmethod
@@ -215,7 +215,7 @@ class ProcessProxy(abc.ABC):
             return hub.run_on_main_hub(self.restart_process)
         with self._lock:
             now = time.monotonic()
-            if self._is_alive() and now - self._last_restart < self.RESTART_COOLDOWN:
+            if self._is_alive() and now - self._last_restart < self.restart_cooldown:
                 log.warning("Restart skipped (cooldown)")
                 return
             self._last_restart = now
@@ -260,7 +260,7 @@ class ProcessProxy(abc.ABC):
                     idle_cycles = 0
                 else:
                     idle_cycles += 1
-                if idle_cycles >= self.ALIVE_CHECK_INTERVAL and not self._is_alive():
+                if idle_cycles >= self.alive_check_interval and not self._is_alive():
                     break
             if not self._shutdown:
                 log.warning("Child process died, stopping reader")
@@ -334,7 +334,7 @@ class ProcessProxy(abc.ABC):
         except ProcessError:
             with self._lock:
                 self._error_count += 1
-                should_restart = self._error_count >= self.AUTO_RESTART_THRESHOLD
+                should_restart = self._error_count >= self.auto_restart_threshold
             if should_restart:
                 log.warning(f"{self._error_count} consecutive errors, restarting")
                 self.restart_process()
