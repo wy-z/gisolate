@@ -4,7 +4,7 @@ import contextlib
 import io
 import logging
 import pickle
-from typing import Any
+from typing import Any, Protocol
 
 import dill
 import gevent.monkey
@@ -44,8 +44,21 @@ class RemoteError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+class Serializer(Protocol):
+    """Pluggable serializer protocol: ``dumps(obj) -> bytes`` / ``loads(bytes) -> obj``."""
+
+    @staticmethod
+    def dumps(obj: Any) -> bytes: ...
+
+    @staticmethod
+    def loads(data: bytes) -> Any: ...
+
+
 class SmartPickle:
-    """Serializer preferring pickle, falling back to dill. Learns from failures."""
+    """Serializer preferring pickle, falling back to dill. Learns from failures.
+
+    Implements the :class:`Serializer` protocol.
+    """
 
     _PICKLE = b"P"
     _DILL = b"D"

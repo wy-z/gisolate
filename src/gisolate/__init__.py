@@ -4,11 +4,12 @@ Run any object in a clean subprocess, call methods transparently via ZMQ IPC.
 Isolates libraries incompatible with gevent monkey-patching.
 """
 
-from ._internal import ProcessError, RemoteError
+from ._internal import ProcessError, RemoteError, Serializer
 from .bridge import ProcessBridge
 from .hub import ensure_hub_started, shutdown as shutdown_hub, spawn_on_main_hub
 from .local import ThreadLocalProxy
 from .proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
+from .pubsub import ProcessPublisher, ProcessSubscriber
 from .subprocess import run_in_subprocess
 
 # Pre-initialize threadpoolctl on main thread to cache library info.
@@ -24,7 +25,10 @@ __all__ = [
     "ProcessBridge",
     "ProcessError",
     "ProcessProxy",
+    "ProcessPublisher",
+    "ProcessSubscriber",
     "RemoteError",
+    "Serializer",
     "ThreadLocalProxy",
     "ensure_hub_started",
     "get_default_mp_context",
