@@ -84,6 +84,47 @@ asyncio.run(main())
 server.close()
 ```
 
+### ProcessPublisher / ProcessSubscriber — one-way fan-out
+
+ZMQ PUB/SUB for one-way data streaming (snapshots, signals, heartbeats). Use this when message loss is acceptable; use `ProcessBridge` when you need request/response with delivery guarantees.
+
+```python
+# Producer (gevent side)
+from gisolate import ProcessPublisher
+
+pub = ProcessPublisher("ipc:///tmp/stream.sock").start()
+pub.publish("v1.snapshot.AAPL", {"price": 150.0})
+pub.publish("v1.heartbeat.gevent", {"ts_ns": 1234567890})
+pub.close()
+
+# Consumer (asyncio side)
+import asyncio
+from gisolate import ProcessSubscriber
+
+async def main():
+    sub = ProcessSubscriber("ipc:///tmp/stream.sock")
+
+    async def on_snapshot(topic, payload):
+        print(topic, payload)
+
+    async def on_heartbeat(topic, payload):
+        print("heartbeat", payload)
+
+    sub.subscribe("v1.snapshot.", on_snapshot)
+    sub.subscribe("v1.heartbeat.", on_heartbeat)
+    sub.start()
+    await asyncio.sleep(10)
+    await sub.close()
+
+asyncio.run(main())
+```
+
+Notes:
+- **Topic prefix matching** — `sub.subscribe("v1.snapshot.", h)` receives every topic starting with that prefix.
+- **Multiple handlers per prefix** — invoked concurrently with `asyncio.gather`. Exceptions in one handler do not kill the reader task.
+- **Lossy by design** — `publish` is non-blocking; messages are dropped when the send queue is full (slow subscriber). Set `sndhwm=` to tune.
+- **Pluggable serializer** — defaults to `SmartPickle`. Pass any object implementing the `Serializer` protocol (`dumps`/`loads`) to use msgpack, JSON, etc.
+
 ### ThreadLocalProxy — per-thread instances
 
 Thread-local proxy using unpatched `threading.local` for true isolation in `gevent.threadpool`:
@@ -131,6 +172,25 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 - **`bridge.address`** — IPC address
 - **`await bridge.call(func, *args, timeout=60, **kwargs)`** — async RPC call (client mode)
 - **`bridge.close()`** — cleanup resources
+
+### `ProcessPublisher(address, *, serializer=SmartPickle, sndhwm=1000)`
+
+- **`pub.start()`** — bind the PUB socket (idempotent, returns self)
+- **`pub.publish(topic, payload)`** — non-blocking publish; drops on slow consumers
+- **`pub.close()`** — cleanup (idempotent)
+- Supports context manager (`with` statement)
+
+### `ProcessSubscriber(address, *, serializer=SmartPickle)`
+
+- **`sub.subscribe(topic_prefix, handler)`** — register an async handler for a topic prefix
+- **`sub.unsubscribe(topic_prefix, handler=None)`** — remove a handler or all handlers for a prefix
+- **`sub.start()`** — connect and spawn the reader task (idempotent, returns self)
+- **`await sub.close()`** — cancel reader and cleanup (idempotent)
+- Supports async context manager (`async with` statement)
+
+### `Serializer` (Protocol)
+
+Anything with `dumps(obj) -> bytes` and `loads(bytes) -> obj` static methods can be used as a serializer for `ProcessPublisher` / `ProcessSubscriber`. Default is `SmartPickle` (pickle, falling back to dill).
 
 ### `ThreadLocalProxy(factory)`
 
