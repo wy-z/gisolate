@@ -11,7 +11,7 @@ from typing import Any
 import gevent
 import pytest
 
-from gisolate.pubsub import ProcessPublisher, ProcessSubscriber
+from gisolate.pubsub import ProcessPublisher, ProcessSubscriber, Runtime
 
 
 def _make_addr() -> str:
@@ -216,7 +216,7 @@ def _run_subscriber_in_thread(
 
         asyncio.run(main())
 
-    t = threading.Thread(target=runner, daemon=True)
+    t = _RealThread(target=runner, daemon=True)
     t.start()
     return t
 
@@ -708,3 +708,181 @@ class TestPubSubIntegration:
         finally:
             stop.set()
             thread.join(timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# Runtime matrix: every (pub_runtime, sub_runtime) combination
+# ---------------------------------------------------------------------------
+
+# conftest.py runs ``gevent.monkey.patch_all()``. Under it, two
+# ``asyncio.run()`` calls in different OS threads collide on asyncio's
+# running-loop TLS (Python 3.14 + gevent monkey-patching). For cross-runtime
+# cases below we therefore put the gevent side in a *real* OS thread and run
+# the asyncio side on the main thread — only one ``asyncio.run`` ever lives.
+import gevent.monkey  # noqa: E402
+
+_RealThread = gevent.monkey.get_original("threading", "Thread")
+
+
+def _gevent_sub_in_thread(addr, prefix, bucket, ready, stop):
+    """Run a GEVENT subscriber in a real OS thread (own gevent hub)."""
+
+    def runner():
+        sub = ProcessSubscriber(addr, runtime=Runtime.GEVENT)
+
+        def handler(topic, payload):
+            bucket.append((topic, payload))
+
+        sub.subscribe(prefix, handler)
+        sub.start()
+        ready.set()
+        try:
+            while not stop.is_set():
+                gevent.sleep(0.05)
+        finally:
+            sub.close()
+
+    t = _RealThread(target=runner, daemon=True)
+    t.start()
+    return t
+
+
+def _async_sub_in_thread(addr, prefix, bucket, ready, stop):
+    """Run an ASYNC subscriber in a real OS thread (own asyncio loop)."""
+
+    def runner():
+        async def main():
+            sub = ProcessSubscriber(addr, runtime=Runtime.ASYNC)
+
+            async def handler(topic, payload):
+                bucket.append((topic, payload))
+
+            sub.subscribe(prefix, handler)
+            sub.start()
+            ready.set()
+            try:
+                while not stop.is_set():
+                    await asyncio.sleep(0.05)
+            finally:
+                await sub.close()
+
+        asyncio.run(main())
+
+    t = _RealThread(target=runner, daemon=True)
+    t.start()
+    return t
+
+
+class TestRuntimeMatrix:
+    """Round-trip a message through every (pub_runtime, sub_runtime) pair."""
+
+    def test_gevent_pub_async_sub(self):
+        """The original supported combination."""
+        addr = _make_addr()
+        bucket: list[tuple[str, Any]] = []
+        ready, stop = threading.Event(), threading.Event()
+
+        sub_t = _async_sub_in_thread(addr, "v1.", bucket, ready, stop)
+        try:
+            assert ready.wait(2.0)
+            pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+            try:
+                for i in range(100):
+                    pub.publish("v1.x", {"i": i})
+                    gevent.sleep(0.05)
+                    if bucket:
+                        break
+            finally:
+                pub.close()
+        finally:
+            stop.set()
+            sub_t.join(3)
+
+        assert bucket, "no messages: gevent -> asyncio"
+        assert bucket[0][0] == "v1.x"
+
+    def test_async_pub_gevent_sub(self):
+        """Asyncio publisher, gevent subscriber."""
+        addr = _make_addr()
+        bucket: list[tuple[str, Any]] = []
+        ready, stop = threading.Event(), threading.Event()
+
+        sub_t = _gevent_sub_in_thread(addr, "v1.", bucket, ready, stop)
+        try:
+            assert ready.wait(2.0)
+
+            async def producer():
+                pub = ProcessPublisher(addr, runtime=Runtime.ASYNC).start()
+                try:
+                    for i in range(100):
+                        await pub.publish("v1.x", {"i": i})
+                        await asyncio.sleep(0.05)
+                        if bucket:
+                            break
+                finally:
+                    await pub.close()
+
+            asyncio.run(producer())
+        finally:
+            stop.set()
+            sub_t.join(3)
+
+        assert bucket, "no messages: asyncio -> gevent"
+        assert bucket[0][0] == "v1.x"
+
+    def test_async_pub_async_sub(self):
+        """Both ends on the same asyncio loop — no cross-thread coordination."""
+        addr = _make_addr()
+        bucket: list[tuple[str, Any]] = []
+
+        async def main():
+            sub = ProcessSubscriber(addr, runtime=Runtime.ASYNC)
+
+            async def handler(topic, payload):
+                bucket.append((topic, payload))
+
+            sub.subscribe("v1.", handler)
+            sub.start()
+            pub = ProcessPublisher(addr, runtime=Runtime.ASYNC).start()
+            try:
+                for i in range(100):
+                    await pub.publish("v1.x", {"i": i})
+                    await asyncio.sleep(0.05)
+                    if bucket:
+                        break
+            finally:
+                await pub.close()
+                await sub.close()
+
+        asyncio.run(main())
+
+        assert bucket, "no messages: asyncio -> asyncio"
+        assert bucket[0][0] == "v1.x"
+
+    def test_gevent_pub_gevent_sub(self):
+        """Both ends on the same gevent hub — no cross-thread coordination."""
+        addr = _make_addr()
+        bucket: list[tuple[str, Any]] = []
+
+        sub = ProcessSubscriber(addr, runtime=Runtime.GEVENT)
+
+        def handler(topic, payload):
+            bucket.append((topic, payload))
+
+        sub.subscribe("v1.", handler)
+        sub.start()
+        try:
+            pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+            try:
+                for i in range(100):
+                    pub.publish("v1.x", {"i": i})
+                    gevent.sleep(0.05)
+                    if bucket:
+                        break
+            finally:
+                pub.close()
+        finally:
+            sub.close()
+
+        assert bucket, "no messages: gevent -> gevent"
+        assert bucket[0][0] == "v1.x"
