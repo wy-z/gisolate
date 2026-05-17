@@ -6,10 +6,13 @@ Isolates libraries incompatible with gevent monkey-patching.
 
 from ._internal import ProcessError, RemoteError, Serializer
 from .bridge import ProcessBridge
-from .hub import ensure_hub_started, shutdown as shutdown_hub, spawn_on_main_hub
+from .hub import ensure_hub_started
+from .hub import shutdown as shutdown_hub
+from .hub import spawn_on_main_hub
 from .local import ThreadLocalProxy
 from .proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 from .pubsub import ProcessPublisher, ProcessSubscriber
+from .pubsub import Runtime as PubSubRuntime
 from .subprocess import run_in_subprocess
 
 # Pre-initialize threadpoolctl on main thread to cache library info.
@@ -27,6 +30,7 @@ __all__ = [
     "ProcessProxy",
     "ProcessPublisher",
     "ProcessSubscriber",
+    "PubSubRuntime",
     "RemoteError",
     "Serializer",
     "ThreadLocalProxy",

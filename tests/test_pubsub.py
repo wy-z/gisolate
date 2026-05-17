@@ -175,7 +175,7 @@ class TestProcessSubscriberLifecycle:
             sub.start()
         assert sub._sock is None
         assert sub._ctx is None
-        assert sub._reader_task is None
+        assert sub._reader is None
         assert not sub._started
 
 
@@ -640,11 +640,11 @@ class TestPubSubIntegration:
                 async def handler(topic, payload):
                     bucket.append((topic, payload))
                     if payload == {"i": 0} and not restarted.is_set():
-                        old_task = sub._reader_task
+                        old_task = sub._reader
                         await sub.close()
                         sub.start()
                         reader_tasks_snapshot["old"] = old_task
-                        reader_tasks_snapshot["new"] = sub._reader_task
+                        reader_tasks_snapshot["new"] = sub._reader
                         restarted.set()
 
                 sub.subscribe("v1.x.", handler)
