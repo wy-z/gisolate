@@ -88,8 +88,17 @@ server.close()
 
 ZMQ PUB/SUB for one-way data streaming (snapshots, signals, heartbeats). Use this when message loss is acceptable; use `ProcessBridge` when you need request/response with delivery guarantees.
 
+Both ends take a `runtime=` kwarg (a `PubSubRuntime` enum, also accepts the strings `"gevent"` / `"asyncio"`) selecting the concurrency backend:
+
+| Class | Default runtime | `publish` / `close` |
+|-------|-----------------|---------------------|
+| `ProcessPublisher` | `PubSubRuntime.GEVENT` | sync in GEVENT, awaitable in ASYNC |
+| `ProcessSubscriber` | `PubSubRuntime.ASYNC` | `close` sync in GEVENT, awaitable in ASYNC; handlers must be sync in GEVENT and `async def` in ASYNC |
+
+The wire format is identical across runtimes, so a gevent publisher pairs with an asyncio subscriber (and vice versa) without any adapter.
+
 ```python
-# Producer (gevent side)
+# Producer (gevent side — default runtime)
 from gisolate import ProcessPublisher
 
 pub = ProcessPublisher("ipc:///tmp/stream.sock").start()
@@ -97,7 +106,7 @@ pub.publish("v1.snapshot.AAPL", {"price": 150.0})
 pub.publish("v1.heartbeat.gevent", {"ts_ns": 1234567890})
 pub.close()
 
-# Consumer (asyncio side)
+# Consumer (asyncio side — default runtime)
 import asyncio
 from gisolate import ProcessSubscriber
 
@@ -119,11 +128,37 @@ async def main():
 asyncio.run(main())
 ```
 
+Asyncio publisher / gevent subscriber — same wire format, just flip the `runtime=`:
+
+```python
+# Producer (asyncio side)
+from gisolate import ProcessPublisher, PubSubRuntime
+
+async def producer():
+    async with ProcessPublisher(addr, runtime=PubSubRuntime.ASYNC) as pub:
+        await pub.publish("v1.tick.AAPL", {"price": 150.0})
+
+# Consumer (gevent side) — handlers are sync
+from gisolate import ProcessSubscriber, PubSubRuntime
+
+def on_tick(topic, payload):  # sync, not async def
+    print(topic, payload)
+
+with ProcessSubscriber(addr, runtime=PubSubRuntime.GEVENT) as sub:
+    sub.subscribe("v1.tick.", on_tick)
+    gevent.sleep(10)
+```
+
 Notes:
-- **Topic prefix matching** — `sub.subscribe("v1.snapshot.", h)` receives every topic starting with that prefix.
-- **Multiple handlers per prefix** — invoked concurrently with `asyncio.gather`. Exceptions in one handler do not kill the reader task.
-- **Lossy by design** — `publish` is non-blocking; messages are dropped when the send queue is full (slow subscriber). Set `sndhwm=` to tune.
-- **Pluggable serializer** — defaults to `SmartPickle`. Pass any object implementing the `Serializer` protocol (`dumps`/`loads`) to use msgpack, JSON, etc.
+- **Runtime must match the host loop** — `start()` requires a running asyncio loop in ASYNC mode and a greenlet context in GEVENT mode. Subsequent `subscribe` / `unsubscribe` / `publish` / `close` calls must stay on that same loop/hub; ZMQ sockets are not thread-safe.
+- **Handler signature follows the subscriber's runtime, not the publisher's** — a gevent subscriber consuming from an asyncio publisher still uses sync handlers.
+- **Context managers** — `with` for GEVENT, `async with` for ASYNC; using the wrong form raises `RuntimeError`. `start()` and `close()` are idempotent.
+- **Topic prefix matching** — `sub.subscribe("v1.snapshot.", h)` receives every topic starting with that prefix. Multiple handlers may share a prefix; in ASYNC mode they run via `asyncio.gather`, in GEVENT mode each is spawned in its own greenlet. An exception in one handler is logged and does not kill the reader.
+- **`close()` from inside a handler is safe** — the reader is not joined in that case (would self-deadlock); sibling handlers in the current dispatch are allowed to finish.
+- **Lossy by design** — `publish` is non-blocking; messages are dropped when the send queue is full (slow subscriber). Tune via `sndhwm=` on the publisher.
+- **Late joiners miss history** — PUB/SUB has no replay; a subscriber that connects after a message was published will not see it. Treat published state as a stream, not a store.
+- **IPC cleanup** — `close()` unlinks the socket file for `ipc://` addresses on the publisher side. Relying on `__del__` is best-effort only; call `close()` (or use a context manager) for deterministic teardown.
+- **Pluggable serializer** — defaults to `SmartPickle` (pickle, falling back to dill). Pass any object implementing the `Serializer` protocol (`dumps`/`loads`) to use msgpack, JSON, etc. Publisher and subscriber must agree.
 
 ### ThreadLocalProxy — per-thread instances
 
@@ -173,24 +208,31 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 - **`await bridge.call(func, *args, timeout=60, **kwargs)`** — async RPC call (client mode)
 - **`bridge.close()`** — cleanup resources
 
-### `ProcessPublisher(address, *, serializer=SmartPickle, sndhwm=1000)`
+### `ProcessPublisher(address, *, runtime=PubSubRuntime.GEVENT, serializer=SmartPickle, sndhwm=1000)`
 
-- **`pub.start()`** — bind the PUB socket (idempotent, returns self)
-- **`pub.publish(topic, payload)`** — non-blocking publish; drops on slow consumers
-- **`pub.close()`** — cleanup (idempotent)
-- Supports context manager (`with` statement)
+- **`pub.start()`** — bind the PUB socket (idempotent, returns self). In ASYNC mode requires a running asyncio loop.
+- **`pub.publish(topic, payload)`** — non-blocking publish; drops on slow consumers. Returns `None` in GEVENT mode, a coroutine in ASYNC mode (must `await`).
+- **`pub.close()`** — cleanup (idempotent). Returns `None` in GEVENT mode, a coroutine in ASYNC mode.
+- **`pub.address`** / **`pub.runtime`** — read-only properties.
+- Context manager: `with` for GEVENT, `async with` for ASYNC. Using the wrong form raises `RuntimeError`.
 
-### `ProcessSubscriber(address, *, serializer=SmartPickle)`
+### `ProcessSubscriber(address, *, runtime=PubSubRuntime.ASYNC, serializer=SmartPickle)`
 
-- **`sub.subscribe(topic_prefix, handler)`** — register an async handler for a topic prefix
-- **`sub.unsubscribe(topic_prefix, handler=None)`** — remove a handler or all handlers for a prefix
-- **`sub.start()`** — connect and spawn the reader task (idempotent, returns self)
-- **`await sub.close()`** — cancel reader and cleanup (idempotent)
-- Supports async context manager (`async with` statement)
+- **`sub.subscribe(topic_prefix, handler)`** — register a handler for a topic prefix. Handler must be sync (`def`) in GEVENT mode and `async def` (or returning an awaitable) in ASYNC mode. Safe to call before or after `start()`.
+- **`sub.unsubscribe(topic_prefix, handler=None)`** — remove a specific handler or all handlers for a prefix. When the last handler is removed, the ZMQ-level subscription is dropped.
+- **`sub.start()`** — connect and spawn the reader (idempotent, returns self). In ASYNC mode requires a running asyncio loop; in GEVENT mode must be called from a greenlet context.
+- **`sub.close()`** — tear down the socket and join the reader (idempotent). Returns `None` in GEVENT mode, a coroutine in ASYNC mode. Safe to call from inside a handler — the reader is not joined in that case to avoid self-deadlock.
+- **`sub.address`** / **`sub.runtime`** — read-only properties.
+- Context manager: `with` for GEVENT, `async with` for ASYNC.
+
+### `PubSubRuntime` (StrEnum)
+
+- **`PubSubRuntime.GEVENT`** (`"gevent"`) — bind to the gevent hub; sync APIs and sync handlers.
+- **`PubSubRuntime.ASYNC`** (`"asyncio"`) — bind to the running asyncio loop; awaitable APIs and async handlers.
 
 ### `Serializer` (Protocol)
 
-Anything with `dumps(obj) -> bytes` and `loads(bytes) -> obj` static methods can be used as a serializer for `ProcessPublisher` / `ProcessSubscriber`. Default is `SmartPickle` (pickle, falling back to dill).
+Anything with `dumps(obj) -> bytes` and `loads(bytes) -> obj` static methods can be used as a serializer for `ProcessPublisher` / `ProcessSubscriber`. Default is `SmartPickle` (pickle, falling back to dill). Publisher and subscriber must agree on the serializer.
 
 ### `ThreadLocalProxy(factory)`
 
