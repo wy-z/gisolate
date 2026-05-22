@@ -267,7 +267,7 @@ class ProcessProxy(abc.ABC):
         except (gevent.GreenletExit, zmq.ZMQError):
             pass
         except Exception as e:
-            log.warning(f"Reader greenlet error: {e}")
+            log.warning(f"Reader greenlet error: {e}", exc_info=True)
         finally:
             self._alive = False
             self._stop(ProcessError("Child process disconnected"))

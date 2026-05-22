@@ -112,6 +112,7 @@ class ProcessBridge:
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            log.warning(f"Bridge reader task died: {e}", exc_info=True)
             # Fail all pending on reader death
             for fut in self._pending.values():
                 if not fut.done():

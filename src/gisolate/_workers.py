@@ -114,8 +114,16 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
                 return False
             try:
                 method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
-            except Exception:
-                send(identity, req_id, False, ValueError("malformed request"))
+            except Exception as e:
+                send(
+                    identity,
+                    req_id,
+                    False,
+                    wrap_exception(
+                        ValueError(f"malformed request: {e!r}"),
+                        traceback.format_exc(),
+                    ),
+                )
                 continue
             pool.spawn(handle, identity, req_id, method, args, kwargs, timeout)
 
@@ -220,9 +228,16 @@ def asyncio_worker(cfg: WorkerConfig):
                     break
                 try:
                     method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
-                except Exception:
+                except Exception as e:
                     await send(
-                        sock, identity, req_id, False, ValueError("malformed request")
+                        sock,
+                        identity,
+                        req_id,
+                        False,
+                        wrap_exception(
+                            ValueError(f"malformed request: {e!r}"),
+                            traceback.format_exc(),
+                        ),
                     )
                     continue
                 task = asyncio.create_task(
