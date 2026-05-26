@@ -18,10 +18,7 @@ import gevent
 import gevent.event
 import zmq
 
-from . import _internal, hub
-from ._internal import ProcessError, SmartPickle
-from ._workers import (_OK, _SHUTDOWN, WorkerConfig, asyncio_worker,
-                       gevent_worker)
+from . import _internal, _workers, hub
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -50,7 +47,7 @@ def get_default_mp_context() -> Any:
 
 
 def _pack_id(n: int) -> bytes:
-    return (n & 0xFFFFFFFF).to_bytes(4)
+    return (n & _workers.ID_MASK).to_bytes(8)
 
 
 def _unpack_id(data: bytes) -> int:
@@ -134,16 +131,16 @@ class ProcessProxy(abc.ABC):
             self._sock.setsockopt(zmq.LINGER, 0)
             self._sock.connect(self._addr)
 
-            config = WorkerConfig(
+            config = _workers.WorkerConfig(
                 ipc_addr=self._addr,
                 factory_bytes=dill.dumps(cls.client_factory),
                 timeout=cls.timeout,
                 max_concurrency=cls.max_concurrency,
             )
             worker, args = (
-                (gevent_worker, (config, cls.patch_kwargs))
+                (_workers.gevent_worker, (config, cls.patch_kwargs))
                 if cls.patch_kwargs is not None
-                else (asyncio_worker, (config,))
+                else (_workers.asyncio_worker, (config,))
             )
 
             mp_ctx = self._get_mp_context()
@@ -155,8 +152,18 @@ class ProcessProxy(abc.ABC):
             self._reader = gevent.spawn(self._read_loop)
             self._error_count = 0
 
-    def _stop(self, error: Exception | None = None, timeout: float = 2.0):
-        """Stop child process. Idempotent."""
+    def _stop(
+        self,
+        error: Exception | None = None,
+        timeout: float = 2.0,
+        graceful: bool = False,
+    ):
+        """Stop child process. Idempotent.
+
+        ``graceful=True`` sends SHUTDOWN and gives the worker up to ``timeout``
+        to drain in-flight calls + close its client before we tear sockets down
+        and fall back to terminate/kill.
+        """
         with self._lock:
             if self._process is None:
                 return
@@ -173,18 +180,41 @@ class ProcessProxy(abc.ABC):
             with contextlib.suppress(gevent.Timeout):
                 reader.kill(block=True, timeout=timeout)
 
+        if graceful:
+            self._graceful_stop(sock, process, timeout)
         self._cleanup_zmq(sock, ctx, addr)
         self._cleanup_process(process)
 
-        err = error or ProcessError("Process stopped")
+        err = error or _internal.ProcessError("Process stopped")
         for ar in pending:
             ar.set_exception(err)
+
+    def _graceful_stop(self, sock, process, timeout: float) -> None:
+        """Ask the worker to drain + exit, then wait up to ``timeout`` for it.
+
+        Sends SHUTDOWN and polls for process exit *before* the socket is
+        closed, so the worker actually receives the frame and runs its
+        pool.join / client.close path (close(linger=0) would otherwise drop
+        the unsent frame and SIGTERM cuts the drain short)."""
+        if sock is not None:
+            # NOBLOCK: a blocking send would hang the main hub if the DEALER
+            # is backpressured (wedged child not draining). NOBLOCK still
+            # queues the frame for delivery during the poll below; if the
+            # send queue is full the child is already stuck, so dropping it
+            # and falling through to terminate is correct.
+            with contextlib.suppress(zmq.ZMQError):
+                sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
+        if process is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and process.is_alive():
+            gevent.sleep(0.05)
 
     def _cleanup_zmq(self, sock, ctx, addr: str | None) -> None:
         if not sock:
             return
         with contextlib.suppress(zmq.ZMQError):
-            sock.send_multipart([b"0", _SHUTDOWN], zmq.NOBLOCK)
+            sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
         with contextlib.suppress(zmq.ZMQError):
             sock.close(linger=0)
         if ctx:
@@ -227,7 +257,7 @@ class ProcessProxy(abc.ABC):
         if not gevent.get_hub().loop.default:
             return hub.run_on_main_hub(functools.partial(self.shutdown, timeout))
         self._shutdown = True
-        self._stop(timeout=timeout)
+        self._stop(timeout=timeout, graceful=True)
 
     def __del__(self):
         # Minimal cleanup only — avoid full shutdown() which marshals
@@ -270,7 +300,7 @@ class ProcessProxy(abc.ABC):
             log.warning(f"Reader greenlet error: {e}", exc_info=True)
         finally:
             self._alive = False
-            self._stop(ProcessError("Child process disconnected"))
+            self._stop(_internal.ProcessError("Child process disconnected"))
 
     def _drain(self) -> bool:
         """Receive and dispatch all available responses; return True if any received."""
@@ -286,11 +316,11 @@ class ProcessProxy(abc.ABC):
             req_id_bytes, ok_flag, payload = parts[:3]
             req_id = _unpack_id(req_id_bytes)
             try:
-                result = SmartPickle.loads(payload)
-                ok = ok_flag == _OK
+                result = _internal.SmartPickle.loads(payload)
+                ok = ok_flag == _workers.OK
             except Exception as e:
                 log.warning(f"Failed to deserialize response: {e}")
-                result, ok = ProcessError(f"Bad response: {e}"), False
+                result, ok = _internal.ProcessError(f"Bad response: {e}"), False
             if not ok and (tb := getattr(result, "__remote_traceback__", None)):
                 log.error(f"Remote traceback:\n{tb}")
             with self._lock:
@@ -309,21 +339,18 @@ class ProcessProxy(abc.ABC):
     ) -> Any:
         self._ensure_running()
 
-        req_id = next(self._counter) & 0xFFFFFFFF
-        ar = (
-            gevent.event.AsyncResult()
-            if _internal.current_thread() is self._owner
-            else hub.AsyncResult()
-        )
+        req_id = next(self._counter) & _workers.ID_MASK
+        is_owner = _internal.current_thread() is self._owner
+        ar = gevent.event.AsyncResult() if is_owner else hub.AsyncResult()
         with self._lock:
             self._pending[req_id] = ar
 
         try:
-            if err := self._send(req_id, method, args, kwargs, rpc_timeout):
-                if isinstance(err, ProcessError):
+            if err := self._send(req_id, method, args, kwargs, rpc_timeout, is_owner):
+                if isinstance(err, _internal.ProcessError):
                     raise err
                 self.restart_process()
-                raise ProcessError("Failed to send request to child") from err
+                raise _internal.ProcessError("Failed to send request to child") from err
 
             result = ar.get(timeout=rpc_timeout + max(2.0, rpc_timeout * 0.1))
             with self._lock:
@@ -331,7 +358,7 @@ class ProcessProxy(abc.ABC):
             return result
         except gevent.Timeout:
             raise TimeoutError(f"{method} timed out after {rpc_timeout}s") from None
-        except ProcessError:
+        except _internal.ProcessError:
             with self._lock:
                 self._error_count += 1
                 should_restart = self._error_count >= self.auto_restart_threshold
@@ -350,14 +377,43 @@ class ProcessProxy(abc.ABC):
         args: tuple,
         kwargs: dict,
         rpc_timeout: float,
+        is_owner: bool,
     ) -> Exception | None:
         try:
-            payload = SmartPickle.dumps((method, args, kwargs, rpc_timeout))
-            with self._lock:
-                self._sock.send_multipart([_pack_id(req_id), payload], zmq.NOBLOCK)
+            payload = _internal.SmartPickle.dumps((method, args, kwargs, rpc_timeout))
+            frames = [_pack_id(req_id), payload]
+            # The zmq.green socket is owned by the main hub (where the reader
+            # greenlet recv()s). Sending from the owner (main) thread shares
+            # that single OS thread — safe. A non-owner native thread must
+            # marshal the send to the main hub; touching the socket from two
+            # OS threads races libzmq's non-thread-safe socket.
+            if is_owner:
+                self._raw_send(req_id, frames)
+            else:
+                try:
+                    hub.run_on_main_hub(
+                        functools.partial(self._raw_send, req_id, frames),
+                        timeout=rpc_timeout,
+                    )
+                except TimeoutError as e:
+                    # Only a marshal timeout proves the main hub is unresponsive
+                    # (the send never reached it). Restarting needs the hub too,
+                    # so fail fast rather than block on another marshal.
+                    raise TimeoutError(f"{method}: main hub unresponsive") from e
             return None
+        except TimeoutError:
+            raise  # propagate to caller; never feed the restart path
         except Exception as e:
             return e
+
+    def _raw_send(self, req_id: int, frames: list[bytes]) -> None:
+        with self._lock:
+            # A marshaled send may run late (e.g. after the call timed out and
+            # the socket was restarted). Skip unless the request is still live,
+            # so a stale frame is never sent to a replacement child/socket.
+            if req_id not in self._pending or self._sock is None:
+                return
+            self._sock.send_multipart(frames, zmq.NOBLOCK)
 
     def _ensure_running(self) -> None:
         if self._shutdown:
@@ -366,7 +422,7 @@ class ProcessProxy(abc.ABC):
             self._alive = False
             self.restart_process()
             if self._sock is None:
-                raise ProcessError("Process not running")
+                raise _internal.ProcessError("Process not running")
 
     def with_timeout(self, timeout: float) -> "_TimeoutView":
         """Return a view that uses the given timeout for all calls.

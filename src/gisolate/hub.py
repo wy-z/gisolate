@@ -3,14 +3,11 @@
 import atexit
 import contextlib
 import functools
-import logging
 from typing import Any, Callable
 
 import gevent
 
 from . import _internal
-
-log = logging.getLogger(__name__)
 
 
 class AsyncResult:
@@ -42,47 +39,31 @@ class AsyncResult:
         raise self._value  # type: ignore[misc]
 
 
-_queue = _internal.Queue()
 _lock = _internal.RLock()
 _started = False
 _stopping = False
-_greenlet: gevent.Greenlet | None = None
+_main_hub: Any = None
 
 
-def _task(func: Callable) -> None:
-    try:
-        func()
-    except Exception as e:
-        log.error(f"main_hub task failed: {e}", exc_info=True)
+def _schedule(func: Callable) -> None:
+    """Spawn ``func`` as a greenlet on the main hub from any thread.
 
-
-def _loop():
-    while not _stopping:
-        try:
-            func, result = _queue.get_nowait()
-            log.debug(f"Main hub picked up task: {func}")
-        except _internal.QueueEmpty:
-            gevent.sleep(0.01)
-            continue
-        if result is None:
-            gevent.spawn(_task, func)
-        else:
-            try:
-                func()
-                result.set(None)
-            except Exception as e:
-                result.set_exception(e)
+    ``run_callback_threadsafe`` wakes the main hub's loop via its async
+    watcher (thread-safe). The callback only spawns a greenlet — ``func``
+    itself may block / switch, which a raw loop callback cannot.
+    """
+    _main_hub.loop.run_callback_threadsafe(lambda: gevent.spawn(func))
 
 
 def ensure_hub_started() -> None:
-    """Lazily start the main hub loop. Thread-safe.
+    """Capture the main hub for cross-thread marshaling. Thread-safe.
 
-    Must be called from the main thread on first invocation so that
-    the hub greenlet is spawned on the default (main) event loop.
-    ProcessProxy.__init__ calls this, ensuring correct ownership when
-    the proxy is created on the main thread.
+    Must be called from the main thread on first invocation so that the
+    captured hub is the default (main) event loop. ProcessProxy.__init__
+    calls this, ensuring correct ownership when the proxy is created on
+    the main thread.
     """
-    global _started, _stopping, _greenlet
+    global _started, _stopping, _main_hub
     if _started and not _stopping:
         return
     with _lock:
@@ -94,36 +75,18 @@ def ensure_hub_started() -> None:
                 "Create your first ProcessProxy on the main thread."
             )
         _stopping = False
-        _greenlet = gevent.spawn(_loop)
+        _main_hub = gevent.get_hub()
         _started = True
 
 
 def shutdown() -> None:
-    """Stop the main hub loop. Safe to call multiple times."""
-    global _started, _stopping, _greenlet
+    """Stop accepting marshaled tasks. Safe to call multiple times."""
+    global _started, _stopping
     with _lock:
         if not _started:
             return
         _stopping = True
-        greenlet = _greenlet
-        _greenlet = None
         _started = False
-    if greenlet is not None:
-        greenlet.join(timeout=2)
-        greenlet.kill(block=False)
-    _fail_pending()
-
-
-def _fail_pending() -> None:
-    """Fail all tasks remaining in queue after shutdown."""
-    err = RuntimeError("Hub is shutting down")
-    while True:
-        try:
-            _, result = _queue.get_nowait()
-        except _internal.QueueEmpty:
-            return
-        if result is not None:
-            result.set_exception(err)
 
 
 def _cleanup_resource_tracker() -> None:
@@ -150,15 +113,26 @@ atexit.register(_cleanup_resource_tracker)
 atexit.register(shutdown)
 
 
-def run_on_main_hub(func: Callable) -> Any:
-    """Run function on main hub and wait for result. Thread-safe."""
+def run_on_main_hub(func: Callable, timeout: float | None = None) -> Any:
+    """Run function on main hub and wait for result. Thread-safe.
+
+    ``timeout`` bounds the wait so a wedged main hub (unable to run the
+    scheduled callback) raises TimeoutError instead of blocking forever.
+    """
     ensure_hub_started()
     with _lock:
         if _stopping:
             raise RuntimeError("Hub is shutting down")
         ar = AsyncResult()
-        _queue.put((func, ar))
-    return ar.get()
+
+    def runner():
+        try:
+            ar.set(func())
+        except Exception as e:
+            ar.set_exception(e)
+
+    _schedule(runner)
+    return ar.get(timeout)
 
 
 def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
@@ -167,4 +141,4 @@ def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
     with _lock:
         if _stopping:
             return
-        _queue.put((functools.partial(func, *args, **kwargs), None))
+    _schedule(functools.partial(func, *args, **kwargs))

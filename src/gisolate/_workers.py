@@ -2,10 +2,11 @@
 
 import contextlib
 import dataclasses
+import time
 import traceback
 from typing import Any
 
-from ._internal import SmartPickle, wrap_exception
+from . import _internal
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -19,17 +20,21 @@ class WorkerConfig:
 
 
 # ZMQ message markers (shared with proxy.py)
-_OK = b"\x01"
-_ERR = b"\x00"
-_SHUTDOWN = b""
+OK = b"\x01"
+ERR = b"\x00"
+SHUTDOWN = b""
+
+# Request-id wraparound mask (64-bit, packed as 8 bytes on the wire)
+ID_MASK = 0xFFFFFFFFFFFFFFFF
 
 
-def _safe_dumps(data: Any, ok: bool) -> tuple[bytes, bool]:
+def safe_dumps(data: Any, ok: bool) -> tuple[bytes, bool]:
     """Serialize data, falling back to wrapped error on failure."""
     try:
-        return SmartPickle.dumps(data), ok
+        return _internal.SmartPickle.dumps(data), ok
     except Exception as exc:
-        return SmartPickle.dumps(wrap_exception(exc, traceback.format_exc())), False
+        err = _internal.wrap_exception(exc, traceback.format_exc())
+        return _internal.SmartPickle.dumps(err), False
 
 
 def safe_close(client: Any) -> None:
@@ -41,8 +46,15 @@ def safe_close(client: Any) -> None:
 
 def _unpack(payload: bytes, default_timeout: float) -> tuple[str, tuple, dict, float]:
     """Unpack request payload (3-tuple legacy or 4-tuple with timeout)."""
-    method, args, kwargs, *rest = SmartPickle.loads(payload)
+    method, args, kwargs, *rest = _internal.SmartPickle.loads(payload)
     return method, args, kwargs, rest[0] if rest else default_timeout
+
+
+def _malformed(exc: Exception) -> Exception:
+    """Wrap a request-parse failure as a serializable error response."""
+    return _internal.wrap_exception(
+        ValueError(f"malformed request: {exc!r}"), traceback.format_exc()
+    )
 
 
 def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
@@ -77,10 +89,10 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     )
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
-        resp, ok = _safe_dumps(data, ok)
+        resp, ok = safe_dumps(data, ok)
         with send_lock:
             with contextlib.suppress(zmq.ZMQError):
-                sock.send_multipart([identity, req_id, _OK if ok else _ERR, resp])
+                sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
 
     def handle(
         identity: bytes,
@@ -88,17 +100,23 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         method: str,
         args: tuple,
         kwargs: dict,
-        timeout: float,
+        deadline: float,
     ):
         nonlocal client
         try:
-            with gevent.Timeout(timeout, TimeoutError(f"{method} timed out")):
+            # Budget from request-accept time so time spent queued behind the
+            # pool counts against the timeout (else a queued call can run after
+            # the caller already gave up).
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{method} timed out")
+            with gevent.Timeout(remaining, TimeoutError(f"{method} timed out")):
                 with client_lock:
                     client = client or factory()
                 result = getattr(client, method)(*args, **kwargs)
             send(identity, req_id, True, result)
         except Exception as e:
-            send(identity, req_id, False, wrap_exception(e, traceback.format_exc()))
+            send(identity, req_id, False, _internal.wrap_exception(e, traceback.format_exc()))
 
     def _drain() -> bool:
         """Drain all available messages. Returns False on shutdown."""
@@ -110,22 +128,17 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
             if len(parts) < 3:
                 continue
             identity, req_id, payload = parts[:3]
-            if payload == _SHUTDOWN:
+            if payload == SHUTDOWN:
                 return False
             try:
                 method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
             except Exception as e:
-                send(
-                    identity,
-                    req_id,
-                    False,
-                    wrap_exception(
-                        ValueError(f"malformed request: {e!r}"),
-                        traceback.format_exc(),
-                    ),
-                )
+                send(identity, req_id, False, _malformed(e))
                 continue
-            pool.spawn(handle, identity, req_id, method, args, kwargs, timeout)
+            pool.spawn(
+                handle, identity, req_id, method, args, kwargs,
+                time.monotonic() + timeout,
+            )
 
     try:
         while True:
@@ -163,15 +176,15 @@ def asyncio_worker(cfg: WorkerConfig):
             if client is None:
                 client = factory()
                 if (connect := getattr(client, "connect", None)) is not None:
-                    await connect() if inspect.iscoroutinefunction(
-                        connect
-                    ) else connect()
+                    result = connect()
+                    if inspect.isawaitable(result):
+                        await result
             return client
 
     async def send(sock, identity: bytes, req_id: bytes, ok: bool, data: Any):
-        resp, ok = _safe_dumps(data, ok)
+        resp, ok = safe_dumps(data, ok)
         with contextlib.suppress(zmq.ZMQError):
-            await sock.send_multipart([identity, req_id, _OK if ok else _ERR, resp])
+            await sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
 
     async def _call(method: str, args: tuple, kwargs: dict, timeout: float):
         c = await get_client()
@@ -190,23 +203,30 @@ def asyncio_worker(cfg: WorkerConfig):
         method: str,
         args: tuple,
         kwargs: dict,
-        timeout: float,
+        deadline: float,
     ):
         ok, result = False, None
         try:
             async with sem if sem else contextlib.nullcontext():
-                result = await _call(method, args, kwargs, timeout)
+                # Budget from accept time so time spent waiting on the
+                # semaphore counts against the timeout.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                result = await _call(method, args, kwargs, remaining)
                 ok = True
         except asyncio.TimeoutError:
             result = TimeoutError(f"{method} timed out")
         except Exception as e:
-            result = wrap_exception(e, traceback.format_exc())
+            result = _internal.wrap_exception(e, traceback.format_exc())
         await send(sock, identity, req_id, ok, result)
 
     async def close_client():
         if (close := getattr(client, "close", None)) is not None:
             with contextlib.suppress(Exception):
-                await close() if inspect.iscoroutinefunction(close) else close()
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     async def main():
         ctx = zmq.asyncio.Context()
@@ -224,24 +244,18 @@ def asyncio_worker(cfg: WorkerConfig):
                 if len(parts) < 3:
                     continue
                 identity, req_id, payload = parts[:3]
-                if payload == _SHUTDOWN:
+                if payload == SHUTDOWN:
                     break
                 try:
                     method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
                 except Exception as e:
-                    await send(
-                        sock,
-                        identity,
-                        req_id,
-                        False,
-                        wrap_exception(
-                            ValueError(f"malformed request: {e!r}"),
-                            traceback.format_exc(),
-                        ),
-                    )
+                    await send(sock, identity, req_id, False, _malformed(e))
                     continue
                 task = asyncio.create_task(
-                    handle(sock, identity, req_id, method, args, kwargs, timeout)
+                    handle(
+                        sock, identity, req_id, method, args, kwargs,
+                        time.monotonic() + timeout,
+                    )
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
