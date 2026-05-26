@@ -7,8 +7,7 @@ from typing import Any, Callable
 
 import gevent
 
-from ._internal import suppress_main_reimport
-from .proxy import get_default_mp_context
+from . import _internal, proxy
 
 log = logging.getLogger(__name__)
 
@@ -31,15 +30,15 @@ def _make_pipe(mp: Any) -> tuple[Any, Any]:
 
 def _worker(conn: Any, fn: Callable, fn_args: tuple, fn_kwargs: dict) -> None:
     """Worker entry point for run_in_subprocess."""
-    from ._internal import SmartPickle, wrap_exception
-
     try:
-        conn.send_bytes(SmartPickle.dumps(("ok", fn(*fn_args, **fn_kwargs))))
+        conn.send_bytes(_internal.SmartPickle.dumps(("ok", fn(*fn_args, **fn_kwargs))))
     except Exception as e:
         import traceback
 
         conn.send_bytes(
-            SmartPickle.dumps(("error", wrap_exception(e, traceback.format_exc())))
+            _internal.SmartPickle.dumps(
+                ("error", _internal.wrap_exception(e, traceback.format_exc()))
+            )
         )
     finally:
         conn.close()
@@ -73,24 +72,22 @@ def run_in_subprocess(
         RuntimeError: If process exits without producing a result.
         Exception: Any exception raised by target function.
     """
-    mp = mp_context or get_default_mp_context()
+    mp = mp_context or proxy.get_default_mp_context()
     parent_conn, child_conn = _make_pipe(mp)
     proc = mp.Process(
         target=_worker,
         args=(child_conn, target, args, kwargs or {}),
         daemon=daemon,
     )
-    with suppress_main_reimport():
+    with _internal.suppress_main_reimport():
         proc.start()
     child_conn.close()
 
     def try_recv() -> Any:
-        from ._internal import SmartPickle
-
         if not parent_conn.poll(0):
             return _EMPTY
         try:
-            msg = SmartPickle.loads(parent_conn.recv_bytes())
+            msg = _internal.SmartPickle.loads(parent_conn.recv_bytes())
         except EOFError:
             return _EMPTY
         match msg:

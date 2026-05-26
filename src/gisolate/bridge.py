@@ -9,8 +9,7 @@ from typing import Any, Callable
 
 import gevent
 
-from ._internal import SmartPickle, wrap_exception
-from ._workers import _ERR, _OK, _SHUTDOWN, _safe_dumps
+from . import _internal, _workers
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +72,7 @@ class ProcessBridge:
         elif self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.ensure_future(self._read_responses())
 
-        req_id = (next(self._req_id) & 0xFFFFFFFF).to_bytes(4)
+        req_id = (next(self._req_id) & _workers.ID_MASK).to_bytes(8)
         fut: asyncio.Future[tuple[bytes, bytes]] = (
             asyncio.get_running_loop().create_future()
         )
@@ -81,7 +80,7 @@ class ProcessBridge:
 
         try:
             await self._sock.send_multipart(  # type: ignore[misc]
-                [req_id, SmartPickle.dumps((func, args, kwargs))]
+                [req_id, _internal.SmartPickle.dumps((func, args, kwargs))]
             )
             status, payload = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -89,8 +88,8 @@ class ProcessBridge:
         finally:
             self._pending.pop(req_id, None)
 
-        result = SmartPickle.loads(payload)
-        if status != _OK:
+        result = _internal.SmartPickle.loads(payload)
+        if status != _workers.OK:
             if tb := getattr(result, "__remote_traceback__", None):
                 log.error(f"Remote traceback:\n{tb}")
             raise result
@@ -112,6 +111,7 @@ class ProcessBridge:
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            log.warning(f"Bridge reader task died: {e}", exc_info=True)
             # Fail all pending on reader death
             for fut in self._pending.values():
                 if not fut.done():
@@ -156,17 +156,17 @@ class ProcessBridge:
             import traceback
 
             try:
-                func, args, kwargs = SmartPickle.loads(payload)
+                func, args, kwargs = _internal.SmartPickle.loads(payload)
                 data = func(*args, **kwargs)
                 ok = True
             except Exception as exc:
-                data = wrap_exception(exc, traceback.format_exc())
+                data = _internal.wrap_exception(exc, traceback.format_exc())
                 ok = False
-            resp, ok = _safe_dumps(data, ok)
+            resp, ok = _workers.safe_dumps(data, ok)
             with send_lock:
                 with contextlib.suppress(zmq_mod.ZMQError):
                     self._sock.send_multipart(
-                        [identity, req_id, _OK if ok else _ERR, resp]
+                        [identity, req_id, _workers.OK if ok else _workers.ERR, resp]
                     )
 
         try:
@@ -177,7 +177,7 @@ class ProcessBridge:
                 if len(parts) < 3:
                     continue
                 identity, req_id, payload = parts[:3]
-                if payload == _SHUTDOWN:
+                if payload == _workers.SHUTDOWN:
                     break
                 group.spawn(_handle, identity, req_id, payload)
         except (gevent.GreenletExit, zmq_mod.ZMQError):

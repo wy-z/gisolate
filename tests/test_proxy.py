@@ -3,10 +3,12 @@
 
 import multiprocessing
 import os
+from unittest.mock import MagicMock
 
 import gevent
 import pytest
 
+from gisolate import hub
 from gisolate.proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 
 from .helpers import adder_factory, tracker_factory
@@ -146,3 +148,91 @@ class TestPerCallTimeout:
         """Ensure 'timeout' kwarg is not consumed by execute()."""
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
             assert proxy.echo_timeout(timeout=42) == 42
+
+
+class TestCrossThreadCalls:
+    """Calls from a native (non-owner) OS thread must marshal the socket
+    send to the main hub — the zmq.green socket is single-thread-owned."""
+
+    def test_call_from_native_thread(self):
+        Thread = gevent.monkey.get_original("threading", "Thread")
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            box = {}
+
+            def worker():
+                try:
+                    box["result"] = proxy.add(7, 8)
+                except Exception as e:  # noqa: BLE001
+                    box["error"] = e
+
+            t = Thread(target=worker)
+            t.start()
+            t.join(timeout=15)
+
+        assert box.get("error") is None
+        assert box["result"] == 15
+
+    def test_concurrent_native_threads(self):
+        Thread = gevent.monkey.get_original("threading", "Thread")
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            results: list[int] = []
+            lock = gevent.monkey.get_original("threading", "Lock")()
+
+            def worker(i):
+                r = proxy.add(i, i)
+                with lock:
+                    results.append(r)
+
+            threads = [Thread(target=worker, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+
+        assert sorted(results) == [2 * i for i in range(8)]
+
+    def test_send_fails_fast_when_hub_unresponsive(self, monkeypatch):
+        """A wedged main hub (marshaled callbacks never run) must make a
+        non-owner send time out and raise TimeoutError instead of blocking
+        forever — and must NOT trigger a (futile) child restart."""
+        Thread = gevent.monkey.get_original("threading", "Thread")
+        with ProcessProxy.create(adder_factory, timeout=0.5) as proxy:
+            # Simulate a wedged hub: scheduled callbacks are dropped.
+            monkeypatch.setattr(hub, "_schedule", lambda *_: None)
+            restarts: list[int] = []
+            monkeypatch.setattr(proxy, "restart_process", lambda: restarts.append(1))
+
+            box: dict = {}
+
+            def worker():
+                try:
+                    proxy.add(1, 2)
+                except Exception as e:  # noqa: BLE001
+                    box["error"] = e
+
+            t = Thread(target=worker)
+            t.start()
+            t.join(timeout=10)
+
+        err = box.get("error")
+        assert isinstance(err, TimeoutError)
+        assert "main hub unresponsive" in str(err)
+        assert restarts == []
+
+    def test_raw_send_drops_stale_request(self):
+        """The _raw_send guard: a late marshaled send must no-op once the
+        request is gone (timed out / socket restarted), so a stale frame is
+        never delivered to a replacement socket."""
+        proxy = ProcessProxy.create(adder_factory, timeout=10)
+        proxy.shutdown()  # tears down the live process: _sock=None, _pending cleared
+        stub = MagicMock()
+        proxy._sock = stub
+
+        # Stale: req_id not pending -> dropped.
+        proxy._raw_send(123, [b"a", b"b"])
+        stub.send_multipart.assert_not_called()
+
+        # Live: req_id pending -> forwarded.
+        proxy._pending[7] = hub.AsyncResult()
+        proxy._raw_send(7, [b"c", b"d"])
+        stub.send_multipart.assert_called_once()

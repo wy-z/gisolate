@@ -1,17 +1,17 @@
 """Tests for gisolate._workers module."""
 
-from gisolate._workers import _ERR, _OK, _SHUTDOWN, safe_close
+from gisolate._workers import ERR, OK, SHUTDOWN, safe_close
 
 
 class TestMarkers:
     def test_ok_marker(self):
-        assert _OK == b"\x01"
+        assert OK == b"\x01"
 
     def test_err_marker(self):
-        assert _ERR == b"\x00"
+        assert ERR == b"\x00"
 
     def test_shutdown_marker(self):
-        assert _SHUTDOWN == b""
+        assert SHUTDOWN == b""
 
 
 class TestSafeClose:

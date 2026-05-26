@@ -21,7 +21,7 @@ import logging
 import os
 from typing import Any, Awaitable, Callable
 
-from ._internal import Serializer, SmartPickle
+from . import _internal
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class ProcessPublisher:
         address: str,
         *,
         runtime: Runtime | str = Runtime.GEVENT,
-        serializer: Serializer = SmartPickle,
+        serializer: _internal.Serializer = _internal.SmartPickle,
         sndhwm: int = 1000,
     ):
         self._addr = address
@@ -305,7 +305,7 @@ class ProcessSubscriber:
         address: str,
         *,
         runtime: Runtime | str = Runtime.ASYNC,
-        serializer: Serializer = SmartPickle,
+        serializer: _internal.Serializer = _internal.SmartPickle,
     ):
         self._addr = address
         # Normalize so a stray ``"gevent"`` / ``"asyncio"`` string doesn't
