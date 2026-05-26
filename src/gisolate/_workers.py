@@ -112,7 +112,8 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
                 raise TimeoutError(f"{method} timed out")
             with gevent.Timeout(remaining, TimeoutError(f"{method} timed out")):
                 with client_lock:
-                    client = client or factory()
+                    if client is None:
+                        client = factory()
                 result = getattr(client, method)(*args, **kwargs)
             send(identity, req_id, True, result)
         except Exception as e:
@@ -165,6 +166,7 @@ def asyncio_worker(cfg: WorkerConfig):
     factory = dill.loads(cfg.factory_bytes)
     client = None
     lock = asyncio.Lock()
+    send_lock = asyncio.Lock()
     sem: asyncio.Semaphore | None = (
         asyncio.Semaphore(cfg.max_concurrency) if cfg.max_concurrency else None
     )
@@ -183,8 +185,9 @@ def asyncio_worker(cfg: WorkerConfig):
 
     async def send(sock, identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = safe_dumps(data, ok)
-        with contextlib.suppress(zmq.ZMQError):
-            await sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
+        async with send_lock:
+            with contextlib.suppress(zmq.ZMQError):
+                await sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
 
     async def _call(method: str, args: tuple, kwargs: dict, timeout: float):
         c = await get_client()

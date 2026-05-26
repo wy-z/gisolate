@@ -79,9 +79,10 @@ class ProcessBridge:
         self._pending[req_id] = fut
 
         try:
-            await self._sock.send_multipart(  # type: ignore[misc]
-                [req_id, _internal.SmartPickle.dumps((func, args, kwargs))]
-            )
+            async with self._send_lock:
+                await self._sock.send_multipart(  # type: ignore[misc]
+                    [req_id, _internal.SmartPickle.dumps((func, args, kwargs))]
+                )
             status, payload = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(f"Timed out after {timeout}s") from None
@@ -137,6 +138,7 @@ class ProcessBridge:
         import zmq.asyncio
 
         self._mode = ProcessBridge.Mode.CLIENT
+        self._send_lock = asyncio.Lock()
         self._ctx = zmq.asyncio.Context()
         self._sock = self._ctx.socket(zmq.DEALER)
         self._sock.setsockopt(zmq.LINGER, 0)
