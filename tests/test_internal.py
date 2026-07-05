@@ -1,13 +1,9 @@
 """Tests for gisolate._internal module."""
 
-import pickle
 
-import dill
-import pytest
-from gisolate._internal import (Event, Local, ProcessError, Queue, QueueEmpty,
-                                RemoteError, RLock, SmartPickle,
-                                current_thread, suppress_main_reimport,
-                                wrap_exception)
+from gisolate._internal import (Event, Local, ProcessError, RemoteError,
+                                RLock, SmartPickle, current_thread,
+                                suppress_main_reimport, wrap_exception)
 
 # ---------------------------------------------------------------------------
 # Unpatched primitives
@@ -37,16 +33,6 @@ class TestUnpatchedPrimitives:
         local = Local()
         local.x = 42
         assert local.x == 42
-
-    def test_queue_put_get(self):
-        q = Queue()
-        q.put("hello")
-        assert q.get_nowait() == "hello"
-
-    def test_queue_empty_raises(self):
-        q = Queue()
-        with pytest.raises(QueueEmpty):
-            q.get_nowait()
 
     def test_current_thread_returns_something(self):
         t = current_thread()

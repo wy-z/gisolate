@@ -13,13 +13,14 @@ In GEVENT mode, ``publish`` / ``close`` are synchronous; in ASYNC mode they
 return awaitables.
 """
 
+import abc
 import asyncio
 import contextlib
 import enum
 import inspect
 import logging
 import os
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Self
 
 from . import _internal
 
@@ -45,12 +46,108 @@ def _safe_close(sock: Any, ctx: Any) -> None:
             ctx.term()
 
 
+class _PubSubBase(abc.ABC):
+    """Shared runtime-dispatch plumbing for publisher/subscriber: lifecycle
+    flags, context managers, and the sync-or-awaitable ``close`` dispatcher.
+    """
+
+    # _start_* implementations own setting ``self._started = True`` once
+    # their resources are live. start() must NOT set it afterwards: with an
+    # eager task factory a handler may run close() *inside* _start_async,
+    # and a trailing flag-set here would resurrect the closed instance.
+    @abc.abstractmethod
+    def _start_gevent(self) -> None: ...
+
+    @abc.abstractmethod
+    def _start_async(self) -> None: ...
+
+    @abc.abstractmethod
+    def _close_gevent(self) -> None: ...
+
+    @abc.abstractmethod
+    async def _close_async(self) -> None: ...
+
+    def __init__(
+        self,
+        address: str,
+        runtime: Runtime | str,
+        serializer: _internal.Serializer,
+    ):
+        self._addr = address
+        # Normalize so a stray ``"gevent"`` / ``"asyncio"`` string doesn't
+        # silently fall through to the else-branch in mode dispatch.
+        self._runtime = Runtime(runtime)
+        self._serializer = serializer
+        self._started = False
+        self._sock: Any = None
+        self._ctx: Any = None
+
+    def __del__(self):
+        # Best-effort sync cleanup from finalizer. Avoid full close(): at GC
+        # time the loop/hub may be torn down (locks can fail, readers leak).
+        # Call close() explicitly for deterministic cleanup.
+        _safe_close(getattr(self, "_sock", None), getattr(self, "_ctx", None))
+
+    def __enter__(self) -> Self:
+        if self._runtime is not Runtime.GEVENT:
+            raise RuntimeError("Use `async with` for ASYNC runtime")
+        return self.start()
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    async def __aenter__(self) -> Self:
+        if self._runtime is not Runtime.ASYNC:
+            raise RuntimeError("Use `with` for GEVENT runtime")
+        return self.start()
+
+    async def __aexit__(self, *_) -> None:
+        await self.close()
+
+    @property
+    def address(self) -> str:
+        """IPC/TCP address."""
+        return self._addr
+
+    @property
+    def runtime(self) -> Runtime:
+        """Concurrency backend selected at construction time."""
+        return self._runtime
+
+    def start(self) -> Self:
+        """Open the socket and start backend resources. Idempotent.
+
+        Returns self for chaining. In ASYNC mode must be called with a
+        running asyncio loop; in GEVENT mode from a greenlet context.
+        Subsequent calls on the instance must run on that same loop/hub
+        (ZMQ sockets are not thread-safe).
+        """
+        if self._started:
+            return self
+        if self._runtime is Runtime.GEVENT:
+            self._start_gevent()
+        else:
+            self._start_async()
+        return self
+
+    def close(self) -> Any:
+        """Tear down the socket. Idempotent.
+
+        Returns ``None`` in GEVENT mode; returns a coroutine in ASYNC mode —
+        the caller must ``await`` it.
+        """
+        if self._runtime is Runtime.GEVENT:
+            self._close_gevent()
+            return None
+        return self._close_async()
+
+
 # ---------------------------------------------------------------------------
 # Publisher
 # ---------------------------------------------------------------------------
 
 
-class ProcessPublisher:
+class ProcessPublisher(_PubSubBase):
     """ZMQ PUB socket for one-way fan-out.
 
     Topic-based dispatch with a pluggable serializer (default
@@ -87,72 +184,20 @@ class ProcessPublisher:
         serializer: _internal.Serializer = _internal.SmartPickle,
         sndhwm: int = 1000,
     ):
-        self._addr = address
-        # Normalize so a stray ``"gevent"`` / ``"asyncio"`` string doesn't
-        # silently fall through to the else-branch in mode dispatch.
-        self._runtime = Runtime(runtime)
-        self._serializer = serializer
+        super().__init__(address, runtime, serializer)
         self._sndhwm = sndhwm
-        self._started = False
-        self._sock: Any = None
-        self._ctx: Any = None
         self._send_lock: Any = None
 
-    def __del__(self):
-        # Best-effort sync cleanup. Avoid full close() — at GC time the
-        # loop/hub may be torn down, so acquiring the send-lock can fail.
-        # The ipc file is left on disk (process is exiting anyway).
-        _safe_close(getattr(self, "_sock", None), getattr(self, "_ctx", None))
-
-    def __enter__(self) -> "ProcessPublisher":
-        if self._runtime is not Runtime.GEVENT:
-            raise RuntimeError("Use `async with` for ASYNC runtime")
-        return self.start()
-
-    def __exit__(self, *_) -> None:
-        self.close()
-
-    async def __aenter__(self) -> "ProcessPublisher":
-        if self._runtime is not Runtime.ASYNC:
-            raise RuntimeError("Use `with` for GEVENT runtime")
-        return self.start()
-
-    async def __aexit__(self, *_) -> None:
-        await self.close()
-
-    @property
-    def address(self) -> str:
-        """IPC/TCP address."""
-        return self._addr
-
-    @property
-    def runtime(self) -> Runtime:
-        """Concurrency backend selected at construction time."""
-        return self._runtime
-
-    def start(self) -> "ProcessPublisher":
-        """Bind the PUB socket. Idempotent. Returns self for chaining.
-
-        In ASYNC mode, must be called with a running asyncio loop.
-        """
-        if self._started:
-            return self
-        if self._runtime is Runtime.GEVENT:
-            self._bind_gevent()
-        else:
-            self._bind_async()
-        self._started = True
-        return self
-
-    def _bind_gevent(self) -> None:
+    def _start_gevent(self) -> None:
         import gevent.lock
         import zmq.green
 
         ctx = zmq.green.Context()
         self._ctx, self._sock = ctx, self._bind_pub(ctx)
         self._send_lock = gevent.lock.Semaphore()
+        self._started = True
 
-    def _bind_async(self) -> None:
+    def _start_async(self) -> None:
         import zmq.asyncio
 
         # Require a running loop *before* allocating ZMQ resources, so a
@@ -162,6 +207,7 @@ class ProcessPublisher:
         ctx = zmq.asyncio.Context()
         self._ctx, self._sock = ctx, self._bind_pub(ctx)
         self._send_lock = asyncio.Lock()
+        self._started = True
 
     def _bind_pub(self, ctx: Any) -> Any:
         """Create + configure + bind a PUB socket on ``ctx``. Closes on failure."""
@@ -229,17 +275,6 @@ class ProcessPublisher:
             except zmq.ZMQError as exc:
                 log.warning("publisher send failed for topic %s: %s", topic, exc)
 
-    def close(self) -> Any:
-        """Tear down the socket. Idempotent.
-
-        Returns ``None`` in GEVENT mode; returns a coroutine in ASYNC mode —
-        the caller must ``await`` it.
-        """
-        if self._runtime is Runtime.GEVENT:
-            self._close_gevent()
-            return None
-        return self._close_async()
-
     def _close_gevent(self) -> None:
         if not self._started:
             return
@@ -269,12 +304,17 @@ class ProcessPublisher:
 # ---------------------------------------------------------------------------
 
 
-class ProcessSubscriber:
+class ProcessSubscriber(_PubSubBase):
     """ZMQ SUB socket. Register topic-prefix handlers; a single reader
     dispatches incoming messages.
 
     Multiple handlers may share a prefix and are invoked concurrently. An
     exception in one handler is logged but does not kill the reader.
+
+    ``close`` is safe to call from inside a handler: the reader is not
+    joined in that case (joining yourself would deadlock); sibling handlers
+    in the current dispatch are allowed to finish — the reader is never
+    cancelled, so the dispatch is not torn down.
 
     Args:
         address: IPC/TCP address (e.g., ``"ipc:///tmp/stream.sock"``).
@@ -307,67 +347,13 @@ class ProcessSubscriber:
         runtime: Runtime | str = Runtime.ASYNC,
         serializer: _internal.Serializer = _internal.SmartPickle,
     ):
-        self._addr = address
-        # Normalize so a stray ``"gevent"`` / ``"asyncio"`` string doesn't
-        # silently fall through to the else-branch in mode dispatch.
-        self._runtime = Runtime(runtime)
-        self._serializer = serializer
-        self._started = False
-        self._sock: Any = None
-        self._ctx: Any = None
+        super().__init__(address, runtime, serializer)
         self._reader: Any = None  # asyncio.Task in ASYNC, Greenlet in GEVENT
         # Tasks/greenlets currently running ._invoke. close() consults this
         # to detect "called from a handler my reader is awaiting" and skip
         # the reader-join (which would self-deadlock).
         self._handler_workers: set[Any] = set()
         self._handlers: dict[str, list[Handler]] = {}
-
-    def __del__(self):
-        # Best-effort sync cleanup from finalizer. Reader is leaked here;
-        # users should call close() explicitly for deterministic cleanup.
-        _safe_close(getattr(self, "_sock", None), getattr(self, "_ctx", None))
-
-    def __enter__(self) -> "ProcessSubscriber":
-        if self._runtime is not Runtime.GEVENT:
-            raise RuntimeError("Use `async with` for ASYNC runtime")
-        return self.start()
-
-    def __exit__(self, *_) -> None:
-        self.close()
-
-    async def __aenter__(self) -> "ProcessSubscriber":
-        if self._runtime is not Runtime.ASYNC:
-            raise RuntimeError("Use `with` for GEVENT runtime")
-        return self.start()
-
-    async def __aexit__(self, *_) -> None:
-        await self.close()
-
-    @property
-    def address(self) -> str:
-        """IPC/TCP address."""
-        return self._addr
-
-    @property
-    def runtime(self) -> Runtime:
-        """Concurrency backend selected at construction time."""
-        return self._runtime
-
-    def start(self) -> "ProcessSubscriber":
-        """Connect the SUB socket and spawn the reader. Idempotent.
-
-        In ASYNC mode must be called with a running asyncio loop; in GEVENT
-        mode must be called from a greenlet context. Subsequent
-        :meth:`subscribe`, :meth:`unsubscribe`, :meth:`close` calls must run
-        on that same loop/hub (ZMQ sockets are not thread-safe).
-        """
-        if self._started:
-            return self
-        if self._runtime is Runtime.GEVENT:
-            self._start_gevent()
-        else:
-            self._start_async()
-        return self
 
     def _start_async(self) -> None:
         import zmq.asyncio
@@ -377,6 +363,9 @@ class ProcessSubscriber:
         sock = self._connect_sub(ctx)
         self._ctx = ctx
         self._sock = sock
+        # Set before spawning the reader: an eager task factory (3.12+,
+        # asyncio.eager_task_factory) runs the task synchronously inside
+        # create_task, so the reader's gate must already see started=True.
         self._started = True
         # Bind the reader to *this* socket. A close()+start() restart from
         # inside a handler swaps ``self._sock``; the stale reader must not
@@ -391,7 +380,7 @@ class ProcessSubscriber:
         sock = self._connect_sub(ctx)
         self._ctx = ctx
         self._sock = sock
-        self._started = True
+        self._started = True  # before spawn, mirroring _start_async
         self._reader = gevent.spawn(self._read_loop_gevent, sock)
 
     def _connect_sub(self, ctx: Any) -> Any:
@@ -458,18 +447,27 @@ class ProcessSubscriber:
             for h in handlers
         ]
 
-    def _decode(self, parts: list[bytes]) -> tuple[str, Any] | None:
-        """Decode a multipart frame. Returns (topic, payload) or None on error."""
+    def _decode_and_match(
+        self, parts: list[bytes]
+    ) -> tuple[str, Any, list[Handler]] | None:
+        """Decode a frame and collect matching handlers.
+
+        Returns ``(topic, payload, handlers)``, or ``None`` when the frame
+        is malformed, undecodable, or matches no handler. Matching happens
+        before payload deserialization so unmatched topics cost nothing.
+        """
         if len(parts) < 2:
             return None
-        topic_bytes, data, *_ = parts
-        topic = topic_bytes.decode("utf-8", errors="replace")
+        topic = parts[0].decode("utf-8", errors="replace")
+        handlers = self._match(topic)
+        if not handlers:
+            return None
         try:
-            payload = self._serializer.loads(data)
+            payload = self._serializer.loads(parts[1])
         except Exception:
             log.exception("subscriber failed to deserialize topic %s", topic)
             return None
-        return topic, payload
+        return topic, payload, handlers
 
     # ----- reader loops --------------------------------------------------
 
@@ -495,16 +493,13 @@ class ProcessSubscriber:
                     if not self._started or sock is not self._sock:
                         return
                     raise
-                decoded = self._decode(parts)
-                if decoded is None:
+                matched = self._decode_and_match(parts)
+                if matched is None:
                     continue
-                topic, payload = decoded
-                handlers = self._match(topic)
-                if not handlers:
-                    continue
-                # return_exceptions=True isolates the reader from a
-                # handler's CancelledError or any BaseException leaking
-                # past _invoke_async.
+                topic, payload, handlers = matched
+                # return_exceptions=True isolates the reader from a handler's
+                # CancelledError or any BaseException leaking past
+                # _invoke_async (plain Exceptions are caught + logged there).
                 results = await asyncio.gather(
                     *(self._invoke_async(h, topic, payload) for h in handlers),
                     return_exceptions=True,
@@ -512,15 +507,6 @@ class ProcessSubscriber:
                 for r in results:
                     if isinstance(r, (SystemExit, KeyboardInterrupt)):
                         raise r
-                    # CancelledError is BaseException (not Exception) since
-                    # 3.8, so ``isinstance(r, Exception)`` naturally skips it.
-                    if isinstance(r, Exception):
-                        log.error(
-                            "subscriber handler raised %s for topic %s",
-                            type(r).__name__,
-                            topic,
-                            exc_info=r,
-                        )
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -552,13 +538,10 @@ class ProcessSubscriber:
                     if not self._started or sock is not self._sock:
                         return
                     raise
-                decoded = self._decode(parts)
-                if decoded is None:
+                matched = self._decode_and_match(parts)
+                if matched is None:
                     continue
-                topic, payload = decoded
-                handlers = self._match(topic)
-                if not handlers:
-                    continue
+                topic, payload, handlers = matched
                 # Spawn-and-forget: matches asyncio.gather(...) semantics of
                 # isolating handlers from the reader and from each other.
                 # Errors are logged in _invoke_gevent.
@@ -626,22 +609,6 @@ class ProcessSubscriber:
 
     # ----- shutdown ------------------------------------------------------
 
-    def close(self) -> Any:
-        """Tear down the socket and join the reader. Idempotent.
-
-        Returns ``None`` in GEVENT mode; returns a coroutine in ASYNC mode —
-        the caller must ``await`` it.
-
-        Safe to call from inside a handler: the reader is not joined in that
-        case (joining yourself would deadlock); sibling handlers in the
-        current dispatch are allowed to finish — we never cancel the reader,
-        so the dispatch gather is not torn down.
-        """
-        if self._runtime is Runtime.GEVENT:
-            self._close_gevent()
-            return None
-        return self._close_async()
-
     def _snapshot_owned(self) -> tuple[Any, Any, Any]:
         """Move owned sock/ctx/reader off ``self`` so a concurrent start()
         can't have its fresh resources closed by us."""
@@ -668,7 +635,10 @@ class ProcessSubscriber:
             and current not in self._handler_workers
             and not reader.done()
         ):
-            with contextlib.suppress(BaseException):
+            # suppress(Exception), not BaseException: asyncio.wait never
+            # raises task failures, so anything wider could only swallow
+            # the closer's own CancelledError — the caller's cancellation.
+            with contextlib.suppress(Exception):
                 await asyncio.wait({reader}, timeout=2.0)
 
     def _close_gevent(self) -> None:
@@ -686,7 +656,11 @@ class ProcessSubscriber:
             and current not in self._handler_workers
             and not reader.dead
         ):
-            with contextlib.suppress(BaseException):
+            # suppress(Exception), not BaseException: join(timeout=...) never
+            # raises its own timeout (gevent identity-checks its internal
+            # timer), so anything wider could only swallow a caller's
+            # enclosing gevent.Timeout or GreenletExit — their cancellation.
+            with contextlib.suppress(Exception):
                 reader.join(timeout=2.0)
 
 

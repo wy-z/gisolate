@@ -10,6 +10,15 @@ import gevent
 from . import _internal
 
 
+class WaitTimeout(TimeoutError):
+    """get() timed out waiting for a result.
+
+    Distinct type so callers can tell a wait-timeout apart from a stored
+    exception that happens to be a TimeoutError (gevent's AsyncResult makes
+    the same distinction via gevent.Timeout).
+    """
+
+
 class AsyncResult:
     """Thread-safe result container compatible with gevent.event.AsyncResult.
 
@@ -33,7 +42,7 @@ class AsyncResult:
 
     def get(self, timeout=None):
         if not self._event.wait(timeout):
-            raise TimeoutError(f"Timed out after {timeout}s")
+            raise WaitTimeout(f"Timed out after {timeout}s")
         if self._ok:
             return self._value
         raise self._value  # type: ignore[misc]
@@ -41,7 +50,6 @@ class AsyncResult:
 
 _lock = _internal.RLock()
 _started = False
-_stopping = False
 _main_hub: Any = None
 
 
@@ -63,29 +71,25 @@ def ensure_hub_started() -> None:
     calls this, ensuring correct ownership when the proxy is created on
     the main thread.
     """
-    global _started, _stopping, _main_hub
-    if _started and not _stopping:
+    global _started, _main_hub
+    if _started:
         return
     with _lock:
-        if _started and not _stopping:
+        if _started:
             return
         if not gevent.get_hub().loop.default:
             raise RuntimeError(
                 "Hub must be started from the main thread. "
                 "Create your first ProcessProxy on the main thread."
             )
-        _stopping = False
         _main_hub = gevent.get_hub()
         _started = True
 
 
 def shutdown() -> None:
     """Stop accepting marshaled tasks. Safe to call multiple times."""
-    global _started, _stopping
+    global _started
     with _lock:
-        if not _started:
-            return
-        _stopping = True
         _started = False
 
 
@@ -121,7 +125,7 @@ def run_on_main_hub(func: Callable, timeout: float | None = None) -> Any:
     """
     ensure_hub_started()
     with _lock:
-        if _stopping:
+        if not _started:
             raise RuntimeError("Hub is shutting down")
         ar = AsyncResult()
 
@@ -139,6 +143,6 @@ def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
     """Schedule function on main hub without waiting. Thread-safe, fire-and-forget."""
     ensure_hub_started()
     with _lock:
-        if _stopping:
+        if not _started:
             return
     _schedule(functools.partial(func, *args, **kwargs))

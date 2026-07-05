@@ -1,7 +1,6 @@
 """Internal primitives: unpatched stdlib, exceptions, serialization."""
 
 import contextlib
-import io
 import logging
 import pickle
 from typing import Any, Protocol
@@ -19,8 +18,6 @@ current_thread = gevent.monkey.get_original("threading", "current_thread")
 RLock = gevent.monkey.get_original("threading", "RLock")
 Event = gevent.monkey.get_original("threading", "Event")
 Local = gevent.monkey.get_original("threading", "local")
-Queue = gevent.monkey.get_original("queue", "Queue")
-QueueEmpty = gevent.monkey.get_original("queue", "Empty")
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -69,16 +66,13 @@ class SmartPickle:
     def dumps(cls, obj: Any) -> bytes:
         if type(obj) in cls._dill_types:
             return cls._DILL + dill.dumps(obj)
-        buf = io.BytesIO()
-        buf.write(cls._PICKLE)
         try:
-            pickle.dump(obj, buf, protocol=5)
+            return cls._PICKLE + pickle.dumps(obj, protocol=5)
         except (pickle.PicklingError, TypeError, AttributeError):
             t = type(obj)
             if t not in cls._BUILTIN_CONTAINERS:
                 cls._dill_types.add(t)
             return cls._DILL + dill.dumps(obj)
-        return buf.getvalue()
 
     @classmethod
     def loads(cls, data: bytes) -> Any:

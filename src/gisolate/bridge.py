@@ -1,5 +1,6 @@
 """ProcessBridge: ZMQ-based RPC bridge for cross-process function calls."""
 
+import asyncio
 import contextlib
 import enum
 import itertools
@@ -31,16 +32,20 @@ class ProcessBridge:
 
     def __init__(self, address: str, mode: "ProcessBridge.Mode"):
         self._addr = address
-        self._init_mode = mode
-        self._mode: ProcessBridge.Mode | None = None
+        self._mode = mode
+        self._started = False
+        self._shutdown = False
         self._req_id = itertools.count()
         self._pending: dict[bytes, Any] = {}
         self._reader_task: Any = None
         self._server_greenlet: gevent.Greenlet | None = None
+        self._send_lock: Any = None
+        self._ctx: Any = None
+        self._sock: Any = None
 
     def __del__(self):
         with contextlib.suppress(Exception):
-            if getattr(self, "_mode", None) is not None:
+            if getattr(self, "_started", False):
                 self.close()
 
     @property
@@ -50,9 +55,9 @@ class ProcessBridge:
 
     def start(self) -> "ProcessBridge":
         """Start the bridge. Idempotent. Returns self for chaining."""
-        if self._mode:
+        if self._started:
             return self
-        if self._init_mode is ProcessBridge.Mode.CLIENT:
+        if self._mode is ProcessBridge.Mode.CLIENT:
             self._start_client()
         else:
             self._start_server()
@@ -63,11 +68,9 @@ class ProcessBridge:
 
         Safe for concurrent calls from multiple coroutines.
         """
-        import asyncio
-
-        if self._init_mode is ProcessBridge.Mode.SERVER:
+        if self._mode is ProcessBridge.Mode.SERVER:
             raise RuntimeError("Cannot call() in server mode")
-        if not self._mode:
+        if not self._started:
             self._start_client()
         elif self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.ensure_future(self._read_responses())
@@ -98,8 +101,6 @@ class ProcessBridge:
 
     async def _read_responses(self) -> None:
         """Single reader task: dispatch responses to pending futures."""
-        import asyncio
-
         try:
             while True:
                 parts = await self._sock.recv_multipart()
@@ -123,7 +124,7 @@ class ProcessBridge:
         """Initialize server (gevent ROUTER socket)."""
         import zmq.green as zmq_mod
 
-        self._mode = ProcessBridge.Mode.SERVER
+        self._started = True
         self._shutdown = False
         self._ctx = zmq_mod.Context()
         self._sock = self._ctx.socket(zmq_mod.ROUTER)
@@ -133,11 +134,9 @@ class ProcessBridge:
 
     def _start_client(self):
         """Initialize client (asyncio DEALER socket + reader task)."""
-        import asyncio
-
         import zmq.asyncio
 
-        self._mode = ProcessBridge.Mode.CLIENT
+        self._started = True
         self._send_lock = asyncio.Lock()
         self._ctx = zmq.asyncio.Context()
         self._sock = self._ctx.socket(zmq.DEALER)
@@ -189,7 +188,7 @@ class ProcessBridge:
 
     def close(self):
         """Cleanup resources. Idempotent."""
-        if not self._mode:
+        if not self._started:
             return
 
         if self._reader_task and not self._reader_task.done():
@@ -213,6 +212,6 @@ class ProcessBridge:
             with contextlib.suppress(OSError):
                 os.unlink(self._addr[6:])
 
-        self._mode = None
+        self._started = False
         self._sock.close(linger=0)
         self._ctx.term()

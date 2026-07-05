@@ -36,10 +36,11 @@ All source lives in `src/gisolate/`. Key modules:
 - **`proxy.py`** — `ProcessProxy`: the main abstraction. Subclass it, implement `client_factory()`, and method calls are transparently forwarded to an isolated child process via ZMQ DEALER/ROUTER sockets. Supports both gevent and asyncio child workers. Use `ProcessProxy.create()` for quick one-off proxies without subclassing.
 - **`_workers.py`** — Child process entry points: `gevent_worker` (with monkey-patching) and `asyncio_worker`. Selected based on whether `patch_kwargs` is set on the proxy class.
 - **`bridge.py`** — `ProcessBridge`: lower-level ZMQ RPC bridge for cross-process function calls (server=gevent ROUTER, client=asyncio DEALER). Unlike ProcessProxy, this sends arbitrary callables rather than method names.
+- **`pubsub.py`** — `ProcessPublisher` / `ProcessSubscriber`: one-way ZMQ PUB/SUB fan-out with topic-prefix handlers. Each side picks its runtime (gevent or asyncio) via the `runtime` kwarg; wire format is runtime-agnostic.
 - **`subprocess.py`** — `run_in_subprocess()`: simple one-shot function execution in a subprocess with gevent-safe polling via `multiprocessing.Pipe`.
 - **`local.py`** — `ThreadLocalProxy`: proxy with true thread-local isolation using unpatched `threading.local`.
 - **`hub.py`** — Marshals tasks to gevent's main event loop. Enables thread-safe operations from non-main threads via `run_on_main_hub()` / `spawn_on_main_hub()`.
-- **`_internal.py`** — Unpatched stdlib primitives (`threading.Event`, `queue.Queue`, etc. via `gevent.monkey.get_original`), custom exceptions (`ProcessError`, `RemoteError`), and `SmartPickle` (pickle-first, dill-fallback serializer).
+- **`_internal.py`** — Unpatched stdlib primitives (`threading.Event`, `threading.RLock`, etc. via `gevent.monkey.get_original`), custom exceptions (`ProcessError`, `RemoteError`), and `SmartPickle` (pickle-first, dill-fallback serializer).
 
 ## Key Design Patterns
 

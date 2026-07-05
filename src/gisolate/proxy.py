@@ -77,7 +77,7 @@ class ProcessProxy(abc.ABC):
     daemon: bool = True
     auto_restart_threshold: int = 6
     restart_cooldown: float = 6.0
-    alive_check_interval: int = 10
+    alive_check_idle_cycles: int = 10
 
     @staticmethod
     @abc.abstractmethod
@@ -97,7 +97,6 @@ class ProcessProxy(abc.ABC):
         self._last_restart = 0.0
         self._error_count = 0
         self._shutdown = False
-        self._alive = False
         self._process: Any = None
         self._reader: gevent.Greenlet | None = None
         self._ctx: Any = None
@@ -148,7 +147,6 @@ class ProcessProxy(abc.ABC):
             with _internal.suppress_main_reimport():
                 self._process.start()
             log.info(f"ProcessProxy started: pid={self._process.pid}, ctx={mp_ctx}")
-            self._alive = True
             self._reader = gevent.spawn(self._read_loop)
             self._error_count = 0
 
@@ -160,14 +158,13 @@ class ProcessProxy(abc.ABC):
     ):
         """Stop child process. Idempotent.
 
-        ``graceful=True`` sends SHUTDOWN and gives the worker up to ``timeout``
-        to drain in-flight calls + close its client before we tear sockets down
-        and fall back to terminate/kill.
+        ``graceful=True`` waits up to ``timeout`` for the worker to drain
+        in-flight calls + close its client before we tear sockets down and
+        fall back to terminate/kill.
         """
         with self._lock:
             if self._process is None:
                 return
-            self._alive = False
             reader, self._reader = self._reader, None
             process, self._process = self._process, None
             sock, self._sock = self._sock, None
@@ -176,45 +173,50 @@ class ProcessProxy(abc.ABC):
             pending = list(self._pending.values())
             self._pending.clear()
 
-        if reader and reader is not gevent.getcurrent():
-            with contextlib.suppress(gevent.Timeout):
+        try:
+            if reader and reader is not gevent.getcurrent():
+                # kill(block=True, timeout=...) never raises its own timeout
+                # (gevent's join identity-checks its internal timer), so a
+                # gevent.Timeout here can only be a caller's enclosing
+                # deadline — it must propagate, not be suppressed.
                 reader.kill(block=True, timeout=timeout)
 
-        if graceful:
-            self._graceful_stop(sock, process, timeout)
-        self._cleanup_zmq(sock, ctx, addr)
-        self._cleanup_process(process)
+            if sock is not None:
+                # Best-effort SHUTDOWN, sent before the socket closes so the
+                # worker can drain + close its client (close(linger=0) would
+                # drop an unsent frame). NOBLOCK: a blocking send would hang
+                # the main hub if the DEALER is backpressured; a full send
+                # queue means the child is already stuck and terminate/kill
+                # below handles it.
+                with contextlib.suppress(zmq.ZMQError):
+                    sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
+            if graceful:
+                # Give the child up to ``timeout`` to drain in-flight calls
+                # and exit on the SHUTDOWN frame, before terminate/kill cuts
+                # it short.
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and process.is_alive():
+                    gevent.sleep(0.05)
+        finally:
+            # State is already detached, so a caller's enclosing gevent.Timeout
+            # must not leave teardown half-done: the child, socket and ipc file
+            # would leak with no handle left to reach them, and pending waiters
+            # would never learn the process is gone. The waits above aren't the
+            # only interruption points — _cleanup_process's process.join()s are
+            # gevent switch points too, so run teardown on its own greenlet: it
+            # completes even if our join() below is interrupted mid-reap.
+            def _teardown():
+                self._cleanup_zmq(sock, ctx, addr)
+                self._cleanup_process(process)
+                err = error or _internal.ProcessError("Process stopped")
+                for ar in pending:
+                    ar.set_exception(err)
 
-        err = error or _internal.ProcessError("Process stopped")
-        for ar in pending:
-            ar.set_exception(err)
-
-    def _graceful_stop(self, sock, process, timeout: float) -> None:
-        """Ask the worker to drain + exit, then wait up to ``timeout`` for it.
-
-        Sends SHUTDOWN and polls for process exit *before* the socket is
-        closed, so the worker actually receives the frame and runs its
-        pool.join / client.close path (close(linger=0) would otherwise drop
-        the unsent frame and SIGTERM cuts the drain short)."""
-        if sock is not None:
-            # NOBLOCK: a blocking send would hang the main hub if the DEALER
-            # is backpressured (wedged child not draining). NOBLOCK still
-            # queues the frame for delivery during the poll below; if the
-            # send queue is full the child is already stuck, so dropping it
-            # and falling through to terminate is correct.
-            with contextlib.suppress(zmq.ZMQError):
-                sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
-        if process is None:
-            return
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and process.is_alive():
-            gevent.sleep(0.05)
+            gevent.spawn(_teardown).join()
 
     def _cleanup_zmq(self, sock, ctx, addr: str | None) -> None:
         if not sock:
             return
-        with contextlib.suppress(zmq.ZMQError):
-            sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
         with contextlib.suppress(zmq.ZMQError):
             sock.close(linger=0)
         if ctx:
@@ -237,7 +239,9 @@ class ProcessProxy(abc.ABC):
             process.join(timeout=0.5)
 
     def _is_alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        # Single read: a concurrent _stop may null _process between checks.
+        p = self._process
+        return p is not None and p.is_alive()
 
     def restart_process(self) -> None:
         """Kill and restart child process. Thread-safe (marshals to main hub)."""
@@ -290,7 +294,7 @@ class ProcessProxy(abc.ABC):
                     idle_cycles = 0
                 else:
                     idle_cycles += 1
-                if idle_cycles >= self.alive_check_interval and not self._is_alive():
+                if idle_cycles >= self.alive_check_idle_cycles and not self._is_alive():
                     break
             if not self._shutdown:
                 log.warning("Child process died, stopping reader")
@@ -299,7 +303,6 @@ class ProcessProxy(abc.ABC):
         except Exception as e:
             log.warning(f"Reader greenlet error: {e}", exc_info=True)
         finally:
-            self._alive = False
             self._stop(_internal.ProcessError("Child process disconnected"))
 
     def _drain(self) -> bool:
@@ -352,12 +355,30 @@ class ProcessProxy(abc.ABC):
                 self.restart_process()
                 raise _internal.ProcessError("Failed to send request to child") from err
 
-            result = ar.get(timeout=rpc_timeout + max(2.0, rpc_timeout * 0.1))
+            wait_timeout = rpc_timeout + max(2.0, rpc_timeout * 0.1)
+            if is_owner:
+                # Custom-exception form: on expiry gevent raises OUR labeled
+                # TimeoutError instead of the Timeout instance, so a caller's
+                # enclosing gevent.Timeout propagates as itself and a child-
+                # sent TimeoutError re-raised by ar.get() keeps its message.
+                with gevent.Timeout(
+                    wait_timeout,
+                    TimeoutError(f"{method} timed out after {rpc_timeout}s"),
+                ):
+                    result = ar.get()
+            else:
+                try:
+                    # hub.WaitTimeout is raised only by hub.AsyncResult's own
+                    # wait deadline; a child-sent TimeoutError re-raised by
+                    # ar.get() passes through un-relabeled.
+                    result = ar.get(timeout=wait_timeout)
+                except hub.WaitTimeout:
+                    raise TimeoutError(
+                        f"{method} timed out after {rpc_timeout}s"
+                    ) from None
             with self._lock:
                 self._error_count = 0
             return result
-        except gevent.Timeout:
-            raise TimeoutError(f"{method} timed out after {rpc_timeout}s") from None
         except _internal.ProcessError:
             with self._lock:
                 self._error_count += 1
@@ -395,7 +416,7 @@ class ProcessProxy(abc.ABC):
                         functools.partial(self._raw_send, req_id, frames),
                         timeout=rpc_timeout,
                     )
-                except TimeoutError as e:
+                except hub.WaitTimeout as e:
                     # Only a marshal timeout proves the main hub is unresponsive
                     # (the send never reached it). Restarting needs the hub too,
                     # so fail fast rather than block on another marshal.
@@ -418,8 +439,7 @@ class ProcessProxy(abc.ABC):
     def _ensure_running(self) -> None:
         if self._shutdown:
             raise RuntimeError("Proxy is shutdown")
-        if not self._alive or not self._is_alive():
-            self._alive = False
+        if not self._is_alive():
             self.restart_process()
             if self._sock is None:
                 raise _internal.ProcessError("Process not running")
