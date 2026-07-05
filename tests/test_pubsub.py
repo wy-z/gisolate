@@ -168,6 +168,41 @@ class TestProcessSubscriberLifecycle:
         asyncio.run(sub.close())  # never started
         asyncio.run(sub.close())
 
+    def test_gevent_close_outer_timeout_not_swallowed(self):
+        """A caller's enclosing gevent.Timeout firing while close() waits on
+        the reader must propagate as their cancellation, not be suppressed."""
+        sub = ProcessSubscriber(_make_addr(), runtime=Runtime.GEVENT)
+        sub.subscribe("x.", lambda _t, _p: None)
+        sub.start()
+        sub._reader.join = lambda *_a, **_k: gevent.sleep(5)  # wedge the join
+        timer = gevent.Timeout.start_new(0.3)
+        try:
+            with pytest.raises(gevent.Timeout) as excinfo:
+                sub.close()
+            assert excinfo.value is timer
+        finally:
+            timer.close()
+
+    def test_async_close_cancellation_not_swallowed(self):
+        """Cancelling the task that runs close() while it waits on the reader
+        must actually cancel it — CancelledError must not be suppressed."""
+        addr = _make_addr()
+
+        async def main() -> None:
+            sub = ProcessSubscriber(addr)
+            sub.subscribe("x.", lambda _t, _p: None)
+            sub.start()
+            wedge = asyncio.create_task(asyncio.sleep(30))
+            sub._reader = wedge  # close() will wait on this instead
+            closer = asyncio.create_task(sub.close())
+            await asyncio.sleep(0.1)
+            closer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closer
+            wedge.cancel()
+
+        asyncio.run(main())
+
     def test_start_without_running_loop_does_not_leak(self):
         """Calling start() outside a running loop must not half-build the subscriber."""
         sub = ProcessSubscriber(_make_addr())
@@ -190,11 +225,14 @@ def _run_subscriber_in_thread(
     ready_evt: threading.Event,
     stop_evt: threading.Event,
     serializer=None,
+    task_factory=None,
 ) -> threading.Thread:
     """Run a SUB in its own thread with its own asyncio loop."""
 
     def runner() -> None:
         async def main() -> None:
+            if task_factory is not None:
+                asyncio.get_running_loop().set_task_factory(task_factory)
             kwargs = {"serializer": serializer} if serializer else {}
             sub = ProcessSubscriber(addr, **kwargs)
             for prefix, bucket in prefixes_and_buckets.items():
@@ -231,6 +269,29 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool
 
 
 class TestPubSubIntegration:
+    def test_close_inside_eager_start_not_resurrected(self):
+        """asyncio.eager_task_factory runs the reader inside create_task; a
+        close() executing there (e.g. from a handler) must not be undone by
+        start()'s remaining code — the subscriber stays closed."""
+        addr = _make_addr()
+
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            loop.set_task_factory(asyncio.eager_task_factory)
+            sub = ProcessSubscriber(addr)
+            real_read_loop = sub._read_loop_async
+
+            async def hijacked(sock):
+                await sub.close()  # handler-close during eager start
+                await real_read_loop(sock)
+
+            sub._read_loop_async = hijacked  # type: ignore[method-assign]
+            sub.start()
+            assert sub._started is False
+            assert sub._sock is None
+
+        asyncio.run(main())
+
     def test_roundtrip_default_serializer(self):
         addr = _make_addr()
         bucket: list[tuple[str, Any]] = []
@@ -311,6 +372,32 @@ class TestPubSubIntegration:
                 # Verify unmatched topic was NOT delivered to any handler.
                 gevent.sleep(0.1)
                 assert all("unmatched" not in t for t, _ in snap + snap2 + hb)
+            finally:
+                pub.close()
+        finally:
+            stop.set()
+            thread.join(timeout=3)
+
+    def test_async_subscriber_with_eager_task_factory(self):
+        """Regression: with asyncio.eager_task_factory (3.12+) create_task runs
+        the reader synchronously inside start(); it must not exit against a
+        not-yet-flagged subscriber and silently drop all messages."""
+        addr = _make_addr()
+        got: list[tuple[str, Any]] = []
+        ready = threading.Event()
+        stop = threading.Event()
+        thread = _run_subscriber_in_thread(
+            addr, {"v1.": got}, ready, stop,
+            task_factory=asyncio.eager_task_factory,
+        )
+        try:
+            assert ready.wait(2.0)
+            pub = ProcessPublisher(addr).start()
+            try:
+                gevent.sleep(0.2)
+                pub.publish("v1.snap", {"n": 1})
+                assert _wait_until(lambda: len(got) >= 1)
+                assert got == [("v1.snap", {"n": 1})]
             finally:
                 pub.close()
         finally:

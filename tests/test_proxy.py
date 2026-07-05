@@ -9,9 +9,10 @@ import gevent
 import pytest
 
 from gisolate import hub
+from gisolate._internal import ProcessError
 from gisolate.proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 
-from .helpers import adder_factory, tracker_factory
+from .helpers import adder_factory, slow_connect_factory, tracker_factory
 
 
 class TestDefaultMpContext:
@@ -49,10 +50,34 @@ class TestProcessProxyCreate:
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
             assert proxy.add(1, 1) == 2
 
+    def test_remote_timeout_error_not_masked_asyncio_worker(self):
+        """A client-raised TimeoutError must keep its message — the asyncio
+        worker's deadline handling must not rewrite it (asyncio.TimeoutError
+        is builtin TimeoutError since 3.10)."""
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            with pytest.raises(TimeoutError, match="quota exceeded"):
+                proxy.raise_timeout()
+
     def test_private_attr_raises(self):
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
             with pytest.raises(AttributeError):
                 proxy._secret
+
+    def test_cancelled_connect_does_not_poison_client(self):
+        """A per-call deadline cancelling the client's async connect() must
+        not cache the half-connected client — the next call rebuilds it."""
+        with ProcessProxy.create(slow_connect_factory, timeout=10) as proxy:
+            with pytest.raises(TimeoutError):
+                proxy.with_timeout(0.3).is_ready()
+            assert proxy.is_ready() is True
+
+    def test_cancelled_connect_closes_orphan(self):
+        """The half-connected client abandoned by a deadline-cancelled
+        connect() must be close()d in the child, not leaked."""
+        with ProcessProxy.create(slow_connect_factory, timeout=10) as proxy:
+            with pytest.raises(TimeoutError):
+                proxy.with_timeout(0.3).close_count()
+            assert proxy.close_count() == 1
 
 
 class TestProcessProxySubclass:
@@ -88,6 +113,17 @@ class TestProcessProxyGeventWorker:
             patch_kwargs={"thread": False, "os": False},
         ) as proxy:
             assert proxy.add(5, 6) == 11
+
+    def test_remote_timeout_error_not_masked(self):
+        """A TimeoutError raised BY the remote method must propagate with its
+        original message, not be rewritten as a local wait-timeout."""
+        with ProcessProxy.create(
+            adder_factory,
+            timeout=10,
+            patch_kwargs={"thread": False, "os": False},
+        ) as proxy:
+            with pytest.raises(TimeoutError, match="quota exceeded"):
+                proxy.raise_timeout()
 
 
 class TestProcessProxyConcurrency:
@@ -148,6 +184,91 @@ class TestPerCallTimeout:
         """Ensure 'timeout' kwarg is not consumed by execute()."""
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
             assert proxy.echo_timeout(timeout=42) == 42
+
+    def test_outer_gevent_timeout_not_relabeled(self):
+        """A caller's enclosing gevent.Timeout firing while the call waits
+        must surface as that caller's Timeout (their cancellation), not be
+        rewritten into this call's TimeoutError."""
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            timer = gevent.Timeout.start_new(0.3)
+            try:
+                with pytest.raises(gevent.Timeout) as excinfo:
+                    proxy.slow(5)
+                assert excinfo.value is timer
+            finally:
+                timer.close()
+
+    def test_outer_timeout_during_stop_not_swallowed(self):
+        """A caller's enclosing gevent.Timeout firing while _stop waits on
+        the reader must propagate as their cancellation — gevent's kill never
+        raises its own timeout, so suppressing Timeout there could only ever
+        swallow the caller's deadline. _stop's teardown must still complete:
+        the child is reaped, not orphaned."""
+        proxy = ProcessProxy.create(adder_factory, timeout=10)
+        proc = proxy._process
+        try:
+            assert proxy.add(1, 1) == 2
+            # Wedge the reader-kill step so the caller's timer fires inside it.
+            proxy._reader.kill = lambda *a, **k: gevent.sleep(5)
+            timer = gevent.Timeout.start_new(0.3)
+            try:
+                with pytest.raises(gevent.Timeout) as excinfo:
+                    proxy.shutdown()
+                assert excinfo.value is timer
+            finally:
+                timer.close()
+            # The interrupt fired mid-teardown, after state was detached;
+            # _stop's finally must still reap the child rather than leak it
+            # with no handle left to reach it.
+            assert not proc.is_alive()
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
+
+    def test_outer_timeout_during_cleanup_fails_pending(self):
+        """The finally's own teardown is interruptible too: _cleanup_process's
+        process.join()s are gevent switch points. A caller's enclosing
+        gevent.Timeout firing *inside* teardown (not just the try-block waits
+        the sibling test covers) must not skip failing pending waiters — they
+        would hang forever. Teardown runs on a detached greenlet that finishes
+        regardless of our interrupted join."""
+        proxy = ProcessProxy.create(adder_factory, timeout=10)
+        proc = proxy._process
+        waiter = gevent.event.AsyncResult()
+        try:
+            assert proxy.add(1, 1) == 2
+            # A pending waiter teardown must fail. Wedge a finally-stage step
+            # so the caller's timer fires inside teardown, before the
+            # pending-fail loop that runs after _cleanup_process.
+            proxy._pending[999] = waiter
+            orig_cleanup = proxy._cleanup_process
+
+            def slow_cleanup(p):
+                gevent.sleep(0.5)
+                orig_cleanup(p)
+
+            proxy._cleanup_process = slow_cleanup
+            timer = gevent.Timeout.start_new(0.2)
+            try:
+                with pytest.raises(gevent.Timeout) as excinfo:
+                    proxy.shutdown()
+                assert excinfo.value is timer
+            finally:
+                timer.close()
+            # shutdown() raised mid-teardown, but the detached greenlet keeps
+            # going: the pending waiter is failed rather than left hanging, and
+            # the child is still reaped.
+            for _ in range(60):
+                if waiter.ready():
+                    break
+                gevent.sleep(0.05)
+            assert isinstance(waiter.exception, ProcessError)
+            assert not proc.is_alive()
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
 
 
 class TestCrossThreadCalls:
@@ -218,6 +339,32 @@ class TestCrossThreadCalls:
         assert isinstance(err, TimeoutError)
         assert "main hub unresponsive" in str(err)
         assert restarts == []
+
+    def test_remote_timeout_error_not_masked_cross_thread(self):
+        """Non-owner path (hub.AsyncResult): a remote TimeoutError must not be
+        rewritten as a local wait-timeout — the two share a type here, unlike
+        the owner path where wait-timeouts are gevent.Timeout."""
+        Thread = gevent.monkey.get_original("threading", "Thread")
+        with ProcessProxy.create(
+            adder_factory,
+            timeout=10,
+            patch_kwargs={"thread": False, "os": False},
+        ) as proxy:
+            box: dict = {}
+
+            def worker():
+                try:
+                    proxy.raise_timeout()
+                except Exception as e:  # noqa: BLE001
+                    box["error"] = e
+
+            t = Thread(target=worker)
+            t.start()
+            t.join(timeout=15)
+
+        err = box.get("error")
+        assert isinstance(err, TimeoutError)
+        assert "quota exceeded" in str(err)
 
     def test_raw_send_drops_stale_request(self):
         """The _raw_send guard: a late marshaled send must no-op once the

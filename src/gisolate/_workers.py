@@ -172,15 +172,37 @@ def asyncio_worker(cfg: WorkerConfig):
     )
     tasks: set[asyncio.Task] = set()
 
+    async def _dispose(c):
+        """Best-effort client close; awaits an async close. Never raises."""
+        with contextlib.suppress(Exception):
+            if (close := getattr(c, "close", None)) is not None:
+                r = close()
+                if inspect.isawaitable(r):
+                    await r
+
     async def get_client():
         nonlocal client
         async with lock:
             if client is None:
-                client = factory()
-                if (connect := getattr(client, "connect", None)) is not None:
-                    result = connect()
-                    if inspect.isawaitable(result):
-                        await result
+                # Publish only after connect succeeds: the per-call deadline
+                # in handle() can cancel us mid-connect, and a half-connected
+                # client stored here would be reused by every later call.
+                c = factory()
+                try:
+                    if (connect := getattr(c, "connect", None)) is not None:
+                        result = connect()
+                        if inspect.isawaitable(result):
+                            await result
+                except BaseException:
+                    # Dispose of the orphan (cancelled mid-connect or failed
+                    # connect) so retry storms don't leak sockets. Detached:
+                    # awaiting here, inside a task being cancelled, could
+                    # hang or be re-cancelled; main() drains ``tasks``.
+                    t = asyncio.get_running_loop().create_task(_dispose(c))
+                    tasks.add(t)
+                    t.add_done_callback(tasks.discard)
+                    raise
+                client = c
             return client
 
     async def send(sock, identity: bytes, req_id: bytes, ok: bool, data: Any):
@@ -189,15 +211,13 @@ def asyncio_worker(cfg: WorkerConfig):
             with contextlib.suppress(zmq.ZMQError):
                 await sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
 
-    async def _call(method: str, args: tuple, kwargs: dict, timeout: float):
+    async def _call(method: str, args: tuple, kwargs: dict):
         c = await get_client()
         fn = getattr(c, method)
         if inspect.iscoroutinefunction(fn):
-            return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)
+            return await fn(*args, **kwargs)
         loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: fn(*args, **kwargs)), timeout
-        )
+        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
     async def handle(
         sock,
@@ -209,27 +229,28 @@ def asyncio_worker(cfg: WorkerConfig):
         deadline: float,
     ):
         ok, result = False, None
+        tm = None
         try:
             async with sem if sem else contextlib.nullcontext():
                 # Budget from accept time so time spent waiting on the
                 # semaphore counts against the timeout.
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise asyncio.TimeoutError
-                result = await _call(method, args, kwargs, remaining)
-                ok = True
-        except asyncio.TimeoutError:
-            result = TimeoutError(f"{method} timed out")
+                    raise TimeoutError
+                async with asyncio.timeout(remaining) as tm:
+                    result = await _call(method, args, kwargs)
+                    ok = True
+        except TimeoutError as e:
+            # A client-raised TimeoutError is indistinguishable by type from
+            # our deadline (asyncio.TimeoutError IS TimeoutError since 3.10);
+            # tm.expired() tells them apart so the client's message survives.
+            if tm is not None and not tm.expired():
+                result = _internal.wrap_exception(e, traceback.format_exc())
+            else:
+                result = TimeoutError(f"{method} timed out")
         except Exception as e:
             result = _internal.wrap_exception(e, traceback.format_exc())
         await send(sock, identity, req_id, ok, result)
-
-    async def close_client():
-        if (close := getattr(client, "close", None)) is not None:
-            with contextlib.suppress(Exception):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
 
     async def main():
         ctx = zmq.asyncio.Context()
@@ -266,7 +287,7 @@ def asyncio_worker(cfg: WorkerConfig):
             if tasks:
                 await asyncio.wait(tasks, timeout=6)
         finally:
-            await close_client()
+            await _dispose(client)
             sock.close(linger=0)
             ctx.term()
 

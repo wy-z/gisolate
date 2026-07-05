@@ -45,6 +45,9 @@ class Adder:
     def fail(self):
         raise ValueError("intentional error")
 
+    def raise_timeout(self):
+        raise TimeoutError("quota exceeded")
+
     def slow(self, seconds=5):
         import time
 
@@ -57,6 +60,34 @@ class Adder:
 
 def adder_factory():
     return Adder()
+
+
+class SlowConnectClient:
+    """Async client whose connect() is slow enough to outlive a short deadline."""
+
+    closes = 0  # class-level so cancelled instances are observable in-child
+
+    def __init__(self):
+        self.ready = False
+
+    async def connect(self):
+        import asyncio
+
+        await asyncio.sleep(0.8)
+        self.ready = True
+
+    async def close(self):
+        type(self).closes += 1
+
+    def is_ready(self):
+        return self.ready
+
+    def close_count(self):
+        return type(self).closes
+
+
+def slow_connect_factory():
+    return SlowConnectClient()
 
 
 def add(a, b):
