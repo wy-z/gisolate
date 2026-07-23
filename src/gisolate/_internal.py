@@ -116,13 +116,25 @@ def suppress_main_reimport():
         mp_spawn.get_preparation_data = orig  # type: ignore[assignment]
 
 
-def wrap_exception(e: Exception, tb_str: str | None = None) -> Exception:
+def wrap_exception(e: BaseException, tb_str: str | None = None) -> Exception:
     """Ensure exception survives serialization round-trip, attach remote traceback."""
-    try:
-        SmartPickle.loads(SmartPickle.dumps(e))
-        exc = e
-    except Exception:
-        exc = RemoteError(f"{type(e).__name__}: {e}", type(e).__name__)
+    exc: Exception | None = None
+    # A non-Exception BaseException (gevent.Timeout, SystemExit) stays wrapped
+    # even if it pickles: re-raised intact in the caller it reads as control
+    # flow rather than as a failed call.
+    if isinstance(e, Exception):
+        with contextlib.suppress(Exception):
+            SmartPickle.loads(SmartPickle.dumps(e))
+            exc = e
+    if exc is None:
+        # Formatted lazily and defensively: this is the last step before an
+        # error reply goes on the wire, so a hostile __str__ must not raise
+        # here — that would strand the caller with no reply at all.
+        try:
+            detail = str(e)
+        except Exception:  # noqa: BLE001
+            detail = "<unprintable>"
+        exc = RemoteError(f"{type(e).__name__}: {detail}", type(e).__name__)
     if tb_str:
         with contextlib.suppress(AttributeError):
             exc.__remote_traceback__ = tb_str  # type: ignore[attr-defined]

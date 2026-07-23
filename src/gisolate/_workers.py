@@ -82,17 +82,44 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     client = None
     client_lock = gevent.lock.RLock()
     send_lock = gevent.lock.Semaphore()
-    pool = (
-        gevent.pool.Pool(cfg.max_concurrency)
-        if cfg.max_concurrency
-        else gevent.pool.Group()
-    )
+    # Unbounded group + explicit slot semaphore: admission happens inside
+    # handle() with a deadline, so saturation can never block _drain.
+    handlers = gevent.pool.Group()
+    slots = gevent.lock.Semaphore(cfg.max_concurrency) if cfg.max_concurrency else None
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = safe_dumps(data, ok)
         with send_lock:
             with contextlib.suppress(zmq.ZMQError):
                 sock.send_multipart([identity, req_id, OK if ok else ERR, resp])
+
+    def _invoke(method: str, args: tuple, kwargs: dict, deadline: float):
+        # Returns (ok, payload) instead of raising: an exception escaping
+        # this greenlet would make gevent print an unhandled-greenlet
+        # traceback to stderr for every client error, and handle() would
+        # never send a reply. GreenletExit (kill, or client-raised) must
+        # still propagate as the greenlet's outcome.
+        nonlocal client
+        try:
+            with client_lock:
+                if client is None:
+                    # An expired request must not trigger one-time client init.
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{method} timed out")
+                    client = factory()
+            # Admission re-checked at the last yield-free instant before the
+            # client call: hub-callback backlog, client_lock contention, or a
+            # slow factory() can delay this greenlet past the deadline even
+            # when the spawning handler saw budget remaining.
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{method} timed out")
+            return True, getattr(client, method)(*args, **kwargs)
+        except gevent.GreenletExit:
+            raise
+        except BaseException as e:
+            # BaseException too: a client's own escaping gevent.Timeout is one,
+            # and letting it kill this greenlet costs the caller a reply.
+            return False, _internal.wrap_exception(e, traceback.format_exc())
 
     def handle(
         identity: bytes,
@@ -102,20 +129,38 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         kwargs: dict,
         deadline: float,
     ):
-        nonlocal client
         try:
-            # Budget from request-accept time so time spent queued behind the
-            # pool counts against the timeout (else a queued call can run after
-            # the caller already gave up).
+            # Budget from request-accept time so time spent waiting for a
+            # slot counts against the timeout (else a queued call can run
+            # after the caller already gave up).
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= 0 or (slots is not None and not slots.acquire(timeout=remaining)):
                 raise TimeoutError(f"{method} timed out")
-            with gevent.Timeout(remaining, TimeoutError(f"{method} timed out")):
-                with client_lock:
-                    if client is None:
-                        client = factory()
-                result = getattr(client, method)(*args, **kwargs)
-            send(identity, req_id, True, result)
+            # The client call runs on its own greenlet: a deadline raised
+            # into client code can be swallowed by retry-on-Exception loops,
+            # but kill()'s GreenletExit is a BaseException no such loop can
+            # catch (a client catching BaseException leaks its slot until
+            # restart — unbeatable). The slot is released only when the
+            # greenlet is truly dead — kill(block=False) leaves the call
+            # unwinding, and freeing the slot before that breaks
+            # max_concurrency. Spawned into handlers so shutdown's join
+            # waits for unwinding calls, not just their handle greenlets.
+            # (rawlink runs in the hub; Semaphore.release never blocks.)
+            g = handlers.spawn(_invoke, method, args, kwargs, deadline)
+            if slots is not None:
+                release = slots.release  # bind: pyright can't narrow `slots` inside the lambda
+                g.rawlink(lambda _g: release())
+            g.join(max(deadline - time.monotonic(), 0.0))
+            if not g.ready():
+                g.kill(block=False)
+                raise TimeoutError(f"{method} timed out")
+            result = g.get(block=False)
+            if isinstance(result, gevent.GreenletExit):
+                # gevent counts GreenletExit as success; a client raising
+                # it must not surface as an OK result.
+                raise RuntimeError(f"{method} killed: {result}")
+            ok, payload = result
+            send(identity, req_id, ok, payload)
         except Exception as e:
             send(identity, req_id, False, _internal.wrap_exception(e, traceback.format_exc()))
 
@@ -136,7 +181,7 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
             except Exception as e:
                 send(identity, req_id, False, _malformed(e))
                 continue
-            pool.spawn(
+            handlers.spawn(
                 handle, identity, req_id, method, args, kwargs,
                 time.monotonic() + timeout,
             )
@@ -148,7 +193,7 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     except zmq.ZMQError:
         pass
     finally:
-        pool.join(timeout=6)
+        handlers.join(timeout=6)
         safe_close(client)
         sock.close(linger=0)
         ctx.term()
@@ -249,6 +294,19 @@ def asyncio_worker(cfg: WorkerConfig):
             else:
                 result = TimeoutError(f"{method} timed out")
         except Exception as e:
+            result = _internal.wrap_exception(e, traceback.format_exc())
+        except asyncio.CancelledError as e:
+            # Cancellation aimed at *this* task (loop shutdown) must stay
+            # cancelled and send nothing. A CancelledError merely leaked by
+            # client code — an inner cancelled await escaping the method —
+            # leaves no cancellation request here, so it is an ordinary
+            # failed call; letting it kill this task would send no reply at
+            # all and strand the caller until its own grace period.
+            task = asyncio.current_task()
+            if task is None or task.cancelling():
+                raise
+            result = _internal.wrap_exception(e, traceback.format_exc())
+        except BaseException as e:
             result = _internal.wrap_exception(e, traceback.format_exc())
         await send(sock, identity, req_id, ok, result)
 

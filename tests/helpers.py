@@ -62,6 +62,100 @@ def adder_factory():
     return Adder()
 
 
+class TimeoutSwallower:
+    """Client whose retry loop swallows any injected exception and keeps
+    blocking — models retry-on-Exception code that eats a raised deadline."""
+
+    active = 0  # class-level so overlap is observable across calls in-child
+    peak = 0
+
+    def swallow_and_hang(self):
+        import time
+
+        while True:
+            try:
+                time.sleep(60)
+            except Exception:  # noqa: BLE001
+                continue
+
+    def hang_with_slow_cleanup(self):
+        import time
+
+        cls = type(self)
+        cls.active += 1
+        cls.peak = max(cls.peak, cls.active)
+        try:
+            time.sleep(60)
+        finally:
+            time.sleep(1.0)  # yielding cleanup — a killed call lingers here
+            cls.active -= 1
+
+    def self_kill(self):
+        import gevent
+
+        raise gevent.GreenletExit("client killed itself")
+
+    def escaping_base_exception(self):
+        import gevent
+
+        # A client's own expiring timeout guard — gevent.Timeout is a
+        # BaseException, so it slips past `except Exception`.
+        with gevent.Timeout(0.05):
+            gevent.sleep(60)
+
+    def get_peak(self):
+        return type(self).peak
+
+    def add(self, a, b):
+        return a + b
+
+
+def swallower_factory():
+    return TimeoutSwallower()
+
+
+class UnprintableError(Exception):
+    """Picklable, but formatting it raises — models exceptions whose __str__
+    touches a lazy/detached attribute."""
+
+    def __str__(self):
+        raise RuntimeError("format failed")
+
+
+class Unprintable:
+    """Client raising an exception that cannot be stringified."""
+
+    def boom(self):
+        raise UnprintableError("payload")
+
+    def add(self, a, b):
+        return a + b
+
+
+def unprintable_factory():
+    return Unprintable()
+
+
+class CancelLeaker:
+    """Async client that leaks a CancelledError from an inner task — the
+    common asyncio shape where a cancelled background await escapes the
+    method the caller invoked."""
+
+    async def leak_cancelled(self):
+        import asyncio
+
+        inner = asyncio.create_task(asyncio.sleep(60))
+        inner.cancel()
+        await inner  # CancelledError is a BaseException, not an Exception
+
+    async def add(self, a, b):
+        return a + b
+
+
+def cancel_leaker_factory():
+    return CancelLeaker()
+
+
 class SlowConnectClient:
     """Async client whose connect() is slow enough to outlive a short deadline."""
 
