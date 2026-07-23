@@ -12,7 +12,14 @@ from gisolate import hub
 from gisolate._internal import ProcessError
 from gisolate.proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 
-from .helpers import adder_factory, slow_connect_factory, tracker_factory
+from .helpers import (
+    adder_factory,
+    cancel_leaker_factory,
+    slow_connect_factory,
+    swallower_factory,
+    tracker_factory,
+    unprintable_factory,
+)
 
 
 class TestDefaultMpContext:
@@ -57,6 +64,28 @@ class TestProcessProxyCreate:
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
             with pytest.raises(TimeoutError, match="quota exceeded"):
                 proxy.raise_timeout()
+
+    def test_client_cancelled_error_still_replies(self):
+        """A CancelledError leaked by client code is a BaseException, so it
+        escapes the asyncio worker's `except Exception` and would kill the
+        handler task with no reply, stranding the caller until its own grace
+        period. Cancellation of the handler task itself must still propagate."""
+        with ProcessProxy.create(cancel_leaker_factory, timeout=10) as proxy:
+            with pytest.raises(Exception, match="CancelledError") as excinfo:
+                proxy.with_timeout(3).leak_cancelled()
+            # The child's error reply, not the parent giving up.
+            assert "timed out after" not in str(excinfo.value)
+            assert proxy.add(1, 2) == 3  # worker still serving
+
+    def test_unprintable_client_error_still_replies(self):
+        """Formatting the error reply must not itself raise: an exception whose
+        __str__ blows up would kill the handler task before send(), stranding
+        the caller until its own grace period."""
+        with ProcessProxy.create(unprintable_factory, timeout=10) as proxy:
+            with pytest.raises(Exception) as excinfo:
+                proxy.with_timeout(3).boom()
+            assert excinfo.type.__name__ == "UnprintableError"  # not a timeout
+            assert proxy.add(1, 2) == 3  # worker still serving
 
     def test_private_attr_raises(self):
         with ProcessProxy.create(adder_factory, timeout=10) as proxy:
@@ -163,6 +192,87 @@ class TestMaxConcurrency:
             gevent.joinall(greenlets, timeout=15)
             peak = proxy.get_peak()
             assert peak > 2
+
+
+def _swallower_proxy():
+    return ProcessProxy.create(
+        swallower_factory,
+        timeout=5,
+        max_concurrency=1,
+        patch_kwargs={"thread": False, "os": False},
+    )
+
+
+class TestGeventWorkerDeadlineIsolation:
+    """The gevent worker's per-call deadline must hold even against client
+    code that swallows the injected TimeoutError, and saturated admission
+    slots must never stop the worker from consuming requests."""
+
+    def test_swallowed_timeout_still_replies_and_frees_slot(self):
+        with _swallower_proxy() as proxy:
+            with pytest.raises(TimeoutError) as excinfo:
+                proxy.with_timeout(1).swallow_and_hang()
+            # The child's own deadline reply ("... timed out"), not the
+            # parent giving up after its grace period ("... after 1s").
+            assert "after" not in str(excinfo.value)
+            # The hung call's slot must be reclaimed: the next call runs.
+            assert proxy.add(1, 2) == 3
+
+    def test_saturated_pool_keeps_consuming_requests(self):
+        with _swallower_proxy() as proxy:
+            assert proxy.add(0, 0) == 0  # warmup: child booted and responsive
+            hog = gevent.spawn(proxy.with_timeout(30).swallow_and_hang)
+            gevent.sleep(0.5)  # hog occupies the only slot
+            try:
+                # This queued request must not block the receive loop: the
+                # child must still read it and reply with its own deadline
+                # ("add timed out"), not leave the parent to give up on an
+                # unresponsive worker ("... after 1s").
+                with pytest.raises(TimeoutError) as excinfo:
+                    proxy.with_timeout(1).add(1, 2)
+                assert "after" not in str(excinfo.value)
+            finally:
+                hog.kill(block=False)
+
+    def test_slot_stays_held_until_killed_call_unwinds(self):
+        """A timed-out call's slot must not be reusable while its GreenletExit
+        unwind (e.g. a yielding finally) is still running — max_concurrency
+        would silently be violated."""
+        with _swallower_proxy() as proxy:
+            assert proxy.add(0, 0) == 0  # warmup
+            with pytest.raises(TimeoutError):
+                proxy.with_timeout(1).hang_with_slow_cleanup()
+            with pytest.raises(TimeoutError):
+                proxy.with_timeout(1).hang_with_slow_cleanup()
+            gevent.sleep(2.5)  # let cleanups finish
+            assert proxy.get_peak() == 1
+
+    def test_client_base_exception_still_replies(self):
+        """A BaseException from client code (gevent.Timeout is one) must come
+        back as an error; killing the invoke greenlet with no reply would
+        strand the caller until its own grace period."""
+        with _swallower_proxy() as proxy:
+            with pytest.raises(Exception, match="Timeout") as excinfo:
+                proxy.with_timeout(3).escaping_base_exception()
+            # The child's error reply, not the parent giving up.
+            assert "timed out after" not in str(excinfo.value)
+
+    def test_unprintable_client_error_still_replies(self):
+        """Same hazard on the gevent side: a raising __str__ must not escape
+        the invoke greenlet and turn the client's error into a bogus one."""
+        with ProcessProxy.create(
+            unprintable_factory, timeout=5, patch_kwargs={"thread": False, "os": False}
+        ) as proxy:
+            with pytest.raises(Exception) as excinfo:
+                proxy.with_timeout(3).boom()
+            assert excinfo.type.__name__ == "UnprintableError"
+
+    def test_client_raised_greenlet_exit_is_an_error(self):
+        """gevent treats GreenletExit as a *successful* greenlet outcome; the
+        worker must not forward it as an OK result."""
+        with _swallower_proxy() as proxy:
+            with pytest.raises(Exception, match="self_kill killed"):
+                proxy.self_kill()
 
 
 class TestPerCallTimeout:
