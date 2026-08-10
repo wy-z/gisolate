@@ -1,5 +1,6 @@
 """Tests for gisolate.subprocess module."""
 
+import multiprocessing.process
 import os
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import pytest
 
 from gisolate.subprocess import run_in_subprocess
 
-from .helpers import add, get_pid, greet, noop, raise_value_error, slow_func
+from .helpers import add, get_pid, greet, noop, raise_value_error, slow_func, suicide
 
 
 class TestRunInSubprocess:
@@ -34,6 +35,17 @@ class TestRunInSubprocess:
 
     def test_returns_none(self):
         assert run_in_subprocess(noop) is None
+
+    def test_crashed_child_reported_when_is_alive_lies(self, monkeypatch):
+        """A gevent parent's libev loop can steal the reap; multiprocessing's
+        waitpid then gets ECHILD and is_alive() calls a dead child running
+        forever. Pinned True here: a crashed target used to burn the whole
+        timeout (1h default) and surface as TimeoutError."""
+        monkeypatch.setattr(
+            multiprocessing.process.BaseProcess, "is_alive", lambda self: True
+        )
+        with pytest.raises(RuntimeError, match="exited with code"):
+            run_in_subprocess(suicide, timeout=30, poll_interval=0.05)
 
     def test_make_pipe_forces_blocking_with_gevent_patch(self):
         script = textwrap.dedent(

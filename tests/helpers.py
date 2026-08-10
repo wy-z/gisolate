@@ -212,3 +212,9 @@ def make_list():
 
 def noop():
     pass
+
+
+def suicide():
+    import signal
+
+    os.kill(os.getpid(), signal.SIGKILL)
