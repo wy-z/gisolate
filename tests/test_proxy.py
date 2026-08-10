@@ -1,8 +1,11 @@
 # pyright: reportAttributeAccessIssue=false, reportGeneralTypeIssues=false
 """Tests for gisolate.proxy module (ProcessProxy)."""
 
+import contextlib
 import multiprocessing
 import os
+import signal
+import time
 from unittest.mock import MagicMock
 
 import gevent
@@ -10,7 +13,12 @@ import pytest
 
 from gisolate import hub
 from gisolate._internal import ProcessError
-from gisolate.proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
+from gisolate.proxy import (
+    ProcessProxy,
+    _proc_exited,
+    get_default_mp_context,
+    set_default_mp_context,
+)
 
 from .helpers import (
     adder_factory,
@@ -132,6 +140,66 @@ class TestProcessProxyRestart:
         proxy.shutdown()
         with pytest.raises(RuntimeError, match="shutdown"):
             proxy.add(1, 2)
+
+    def test_reaped_child_detected_and_restarted(self):
+        """A gevent parent's libev loop steals child reaps via its SIGCHLD
+        handler; multiprocessing's ``waitpid`` then fails with ECHILD and
+        ``is_alive()`` answers True forever. The proxy must see through the
+        lie (q-trade #435: a segfaulted child passed every liveness check
+        for four hours)."""
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            assert proxy.echo("warm") == "warm"
+            process = proxy._process
+            pid = process.pid
+            os.kill(pid, signal.SIGKILL)
+            # Steal the reap exactly as libev's child watcher does. It may
+            # legitimately have beaten us to it — same end state.
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            # mp bookkeeping is now permanently wrong…
+            assert process.is_alive()
+            # …but the sentinel is not.
+            assert not proxy._is_alive()
+            # The next call restarts the child and serves.
+            assert proxy.echo("back") == "back"
+            assert proxy.pid() != pid
+
+    def test_dead_child_in_cooldown_fails_fast(self):
+        """A child dying within the cooldown window must not respawn on
+        every execute; the call fails fast instead of burning its timeout."""
+        with ProcessProxy.create(adder_factory, timeout=10) as proxy:
+            proxy.restart_process()  # stamps _last_restart
+            pid = proxy._process.pid
+            os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            start = time.monotonic()
+            # "not running" (restart skipped) or "disconnected" (reader won
+            # the race and flushed) — both are the intended fast failure.
+            with pytest.raises(ProcessError):
+                proxy.add(1, 2)
+            assert time.monotonic() - start < proxy.timeout  # no rpc-timeout burn
+
+    def test_teardown_racing_registration_fails_fast(self):
+        """_stop can land between the liveness check and request registration
+        (_is_alive polls the sentinel, which yields). The request is then
+        pending with no socket: it must raise, not sit out the rpc timeout."""
+        with ProcessProxy.create(adder_factory, timeout=5) as proxy:
+            assert proxy.add(1, 2) == 3
+            alive, fired = proxy._is_alive, []
+
+            def racing_is_alive():
+                ok = alive()
+                if ok and not fired:  # once, at the exact window
+                    fired.append(1)
+                    proxy._stop()
+                return ok
+
+            proxy._is_alive = racing_is_alive
+            start = time.monotonic()
+            with pytest.raises(ProcessError):
+                proxy.add(1, 2)
+            assert time.monotonic() - start < proxy.timeout
 
 
 class TestProcessProxyGeventWorker:
@@ -330,9 +398,9 @@ class TestPerCallTimeout:
             # The interrupt fired mid-teardown, after state was detached;
             # _stop's finally must still reap the child rather than leak it
             # with no handle left to reach it.
-            assert not proc.is_alive()
+            assert _proc_exited(proc)
         finally:
-            if proc.is_alive():
+            if not _proc_exited(proc):
                 proc.terminate()
                 proc.join(timeout=1)
 
@@ -374,9 +442,9 @@ class TestPerCallTimeout:
                     break
                 gevent.sleep(0.05)
             assert isinstance(waiter.exception, ProcessError)
-            assert not proc.is_alive()
+            assert _proc_exited(proc)
         finally:
-            if proc.is_alive():
+            if not _proc_exited(proc):
                 proc.terminate()
                 proc.join(timeout=1)
 

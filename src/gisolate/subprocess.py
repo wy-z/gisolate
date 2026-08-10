@@ -102,10 +102,10 @@ def run_in_subprocess(
 
     def cleanup():
         parent_conn.close()
-        if proc.is_alive():
+        if not proxy._proc_exited(proc):
             proc.terminate()
         proc.join(timeout=2)
-        if proc.is_alive():
+        if not proxy._proc_exited(proc):
             proc.kill()
             proc.join(timeout=1)
 
@@ -114,7 +114,10 @@ def run_in_subprocess(
         while time.monotonic() < deadline:
             if (result := try_recv()) is not _EMPTY:
                 return result
-            if not proc.is_alive():
+            # Sentinel, not is_alive(): under a stolen reap (proxy._proc_exited)
+            # a crashed target burns the whole timeout — an hour by default —
+            # and surfaces as TimeoutError instead of its real exit.
+            if proxy._proc_exited(proc):
                 if (result := try_recv()) is not _EMPTY:
                     return result
                 raise RuntimeError(f"Subprocess exited with code {proc.exitcode}")

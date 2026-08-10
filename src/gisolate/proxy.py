@@ -6,6 +6,7 @@ import functools
 import itertools
 import logging
 import multiprocessing
+import multiprocessing.connection
 import os
 import signal
 import tempfile
@@ -52,6 +53,21 @@ def _pack_id(n: int) -> bytes:
 
 def _unpack_id(data: bytes) -> int:
     return int.from_bytes(data)
+
+
+def _proc_exited(process: Any) -> bool:
+    """True iff the child has exited — even if something else reaped it.
+
+    ``Process.is_alive()`` trusts ``waitpid``: under a gevent parent, libev's
+    default-loop SIGCHLD handler reaps children first, ``waitpid`` then fails
+    with ECHILD and ``poll()`` answers "still running" forever — a segfaulted
+    child passed every liveness check for hours (q-trade #435). The sentinel
+    fd turns readable exactly when the child exits, no reaping involved.
+    """
+    try:
+        return bool(multiprocessing.connection.wait([process.sentinel], timeout=0))
+    except (OSError, ValueError):
+        return True  # sentinel closed/invalid: no live child behind it
 
 
 class ProcessProxy(abc.ABC):
@@ -195,7 +211,7 @@ class ProcessProxy(abc.ABC):
                 # and exit on the SHUTDOWN frame, before terminate/kill cuts
                 # it short.
                 deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline and process.is_alive():
+                while time.monotonic() < deadline and not _proc_exited(process):
                     gevent.sleep(0.05)
         finally:
             # State is already detached, so a caller's enclosing gevent.Timeout
@@ -228,11 +244,14 @@ class ProcessProxy(abc.ABC):
 
     def _cleanup_process(self, process) -> None:
         process.join(timeout=0.3)
-        if not process.is_alive():
+        # Gate signaling on the sentinel, not is_alive(): after a stolen reap
+        # (see _proc_exited) is_alive() stays True and the pid may already be
+        # recycled — terminate/SIGKILL would hit an innocent process.
+        if _proc_exited(process):
             return
         process.terminate()
         process.join(timeout=0.5)
-        if process.is_alive() and process.pid:
+        if not _proc_exited(process) and process.pid:
             log.warning("Process did not terminate, sending SIGKILL")
             with contextlib.suppress(OSError):
                 os.kill(process.pid, signal.SIGKILL)
@@ -241,7 +260,7 @@ class ProcessProxy(abc.ABC):
     def _is_alive(self) -> bool:
         # Single read: a concurrent _stop may null _process between checks.
         p = self._process
-        return p is not None and p.is_alive()
+        return p is not None and not _proc_exited(p)
 
     def restart_process(self) -> None:
         """Kill and restart child process. Thread-safe (marshals to main hub)."""
@@ -249,7 +268,11 @@ class ProcessProxy(abc.ABC):
             return hub.run_on_main_hub(self.restart_process)
         with self._lock:
             now = time.monotonic()
-            if self._is_alive() and now - self._last_restart < self.restart_cooldown:
+            # Uniform cooldown, dead child included: a client that crashes
+            # during startup would otherwise respawn on every execute.
+            # Callers aren't stranded — _ensure_running fails fast on a
+            # skipped restart, and _stop flushes pending waiters.
+            if now - self._last_restart < self.restart_cooldown:
                 log.warning("Restart skipped (cooldown)")
                 return
             self._last_restart = now
@@ -266,10 +289,18 @@ class ProcessProxy(abc.ABC):
     def __del__(self):
         # Minimal cleanup only — avoid full shutdown() which marshals
         # to main hub and may fail during GC or interpreter shutdown.
-        with contextlib.suppress(Exception):
+        # Two suppressions, not one: _proc_exited polls the sentinel, which is
+        # a gevent switch point, so a caller's Timeout (a BaseException) can
+        # land inside the liveness check — it must not take the socket
+        # teardown down with it.
+        with contextlib.suppress(BaseException):
             process = getattr(self, "_process", None)
-            if process is not None:
+            # Same sentinel gate as _cleanup_process: terminate() signals the
+            # recorded pid whenever mp thinks the child is unreaped, and after
+            # a stolen reap that pid may belong to someone else.
+            if process is not None and not _proc_exited(process):
                 process.terminate()
+        with contextlib.suppress(Exception):
             sock = getattr(self, "_sock", None)
             if sock is not None:
                 sock.close(linger=0)
@@ -432,8 +463,14 @@ class ProcessProxy(abc.ABC):
             # A marshaled send may run late (e.g. after the call timed out and
             # the socket was restarted). Skip unless the request is still live,
             # so a stale frame is never sent to a replacement child/socket.
-            if req_id not in self._pending or self._sock is None:
+            if req_id not in self._pending:
                 return
+            # Still pending but the socket is gone: _stop landed between the
+            # liveness check and registration (_is_alive is a switch point —
+            # mp.connection.wait polls a patched select). Dropping silently
+            # here would leave the caller waiting out its full rpc timeout.
+            if self._sock is None:
+                raise _internal.ProcessError("Process not running")
             self._sock.send_multipart(frames, zmq.NOBLOCK)
 
     def _ensure_running(self) -> None:
@@ -441,7 +478,9 @@ class ProcessProxy(abc.ABC):
             raise RuntimeError("Proxy is shutdown")
         if not self._is_alive():
             self.restart_process()
-            if self._sock is None:
+            # Still dead (restart in cooldown, or start failed): fail fast.
+            # Proceeding would send into the void and burn the full timeout.
+            if not self._is_alive():
                 raise _internal.ProcessError("Process not running")
 
     def with_timeout(self, timeout: float) -> "_TimeoutView":
