@@ -15,7 +15,6 @@ class WorkerConfig:
 
     ipc_addr: str
     factory_bytes: bytes
-    timeout: float
     max_concurrency: int | None = None
 
 
@@ -42,12 +41,6 @@ def safe_close(client: Any) -> None:
     if close := getattr(client, "close", None):
         with contextlib.suppress(Exception):
             close()
-
-
-def _unpack(payload: bytes, default_timeout: float) -> tuple[str, tuple, dict, float]:
-    """Unpack request payload (3-tuple legacy or 4-tuple with timeout)."""
-    method, args, kwargs, *rest = _internal.SmartPickle.loads(payload)
-    return method, args, kwargs, rest[0] if rest else default_timeout
 
 
 def _malformed(exc: Exception) -> Exception:
@@ -177,7 +170,7 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
             if payload == SHUTDOWN:
                 return False
             try:
-                method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
+                method, args, kwargs, timeout = _internal.SmartPickle.loads(payload)
             except Exception as e:
                 send(identity, req_id, False, _malformed(e))
                 continue
@@ -329,7 +322,7 @@ def asyncio_worker(cfg: WorkerConfig):
                 if payload == SHUTDOWN:
                     break
                 try:
-                    method, args, kwargs, timeout = _unpack(payload, cfg.timeout)
+                    method, args, kwargs, timeout = _internal.SmartPickle.loads(payload)
                 except Exception as e:
                     await send(sock, identity, req_id, False, _malformed(e))
                     continue
