@@ -47,14 +47,6 @@ def get_default_mp_context() -> Any:
     return _default_mp_context or multiprocessing.get_context("spawn")
 
 
-def _pack_id(n: int) -> bytes:
-    return (n & _workers.ID_MASK).to_bytes(8)
-
-
-def _unpack_id(data: bytes) -> int:
-    return int.from_bytes(data)
-
-
 def _proc_exited(process: Any) -> bool:
     """True iff the child has exited — even if something else reaped it.
 
@@ -118,14 +110,10 @@ class ProcessProxy(abc.ABC):
         self._ctx: Any = None
         self._sock: Any = None
         self._addr: str | None = None
-        self._owner = _internal.current_thread()
         hub.ensure_hub_started()
         self._start()
 
     # --- Lifecycle ---
-
-    def _get_mp_context(self) -> Any:
-        return type(self).mp_context or get_default_mp_context()
 
     def _start(self):
         """Start child process if not running."""
@@ -149,7 +137,6 @@ class ProcessProxy(abc.ABC):
             config = _workers.WorkerConfig(
                 ipc_addr=self._addr,
                 factory_bytes=dill.dumps(cls.client_factory),
-                timeout=cls.timeout,
                 max_concurrency=cls.max_concurrency,
             )
             worker, args = (
@@ -158,7 +145,7 @@ class ProcessProxy(abc.ABC):
                 else (_workers.asyncio_worker, (config,))
             )
 
-            mp_ctx = self._get_mp_context()
+            mp_ctx = cls.mp_context or get_default_mp_context()
             self._process = mp_ctx.Process(target=worker, daemon=cls.daemon, args=args)
             with _internal.suppress_main_reimport():
                 self._process.start()
@@ -348,7 +335,7 @@ class ProcessProxy(abc.ABC):
             if len(parts) < 3:
                 continue
             req_id_bytes, ok_flag, payload = parts[:3]
-            req_id = _unpack_id(req_id_bytes)
+            req_id = int.from_bytes(req_id_bytes)
             try:
                 result = _internal.SmartPickle.loads(payload)
                 ok = ok_flag == _workers.OK
@@ -433,7 +420,7 @@ class ProcessProxy(abc.ABC):
     ) -> Exception | None:
         try:
             payload = _internal.SmartPickle.dumps((method, args, kwargs, rpc_timeout))
-            frames = [_pack_id(req_id), payload]
+            frames = [req_id.to_bytes(8), payload]
             # The zmq.green socket is owned by the main hub (where the reader
             # greenlet recv()s). Sending from the owner (main) thread shares
             # that single OS thread — safe. A non-owner native thread must

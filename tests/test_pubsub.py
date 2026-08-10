@@ -1,6 +1,7 @@
 """Tests for gisolate.pubsub (ProcessPublisher / ProcessSubscriber)."""
 
 import asyncio
+import contextlib
 import json
 import tempfile
 import threading
@@ -72,15 +73,12 @@ class TestProcessPublisher:
 
     def test_publish_no_subscribers_does_not_block(self):
         """Without a SUB connected, NOBLOCK publish must return immediately."""
-        pub = ProcessPublisher(_make_addr()).start()
-        try:
+        with ProcessPublisher(_make_addr()) as pub:
             t0 = time.monotonic()
             for i in range(2000):
                 pub.publish("v1.fast", {"i": i})
             elapsed = time.monotonic() - t0
             assert elapsed < 2.0  # generous bound; we mostly care it didn't hang
-        finally:
-            pub.close()
 
     def test_context_manager(self):
         addr = _make_addr()
@@ -89,11 +87,8 @@ class TestProcessPublisher:
             pub.publish("x", 1)
 
     def test_custom_serializer(self):
-        pub = ProcessPublisher(_make_addr(), serializer=JSONSerializer).start()
-        try:
+        with ProcessPublisher(_make_addr(), serializer=JSONSerializer) as pub:
             pub.publish("t", {"a": 1})
-        finally:
-            pub.close()
 
     def test_concurrent_publish_and_close(self):
         """publish() running concurrently with close() must not crash on a freed socket.
@@ -219,15 +214,19 @@ class TestProcessSubscriberLifecycle:
 # ---------------------------------------------------------------------------
 
 
-def _run_subscriber_in_thread(
+@contextlib.contextmanager
+def _subscriber_thread(
     addr: str,
     prefixes_and_buckets: dict[str, list[tuple[str, Any]]],
-    ready_evt: threading.Event,
-    stop_evt: threading.Event,
     serializer=None,
     task_factory=None,
-) -> threading.Thread:
-    """Run a SUB in its own thread with its own asyncio loop."""
+):
+    """Run a SUB in its own thread with its own asyncio loop for the block.
+
+    Yields only once the subscriber has started, and stops + joins the thread
+    on exit — including when the readiness wait itself fails.
+    """
+    ready_evt, stop_evt = threading.Event(), threading.Event()
 
     def runner() -> None:
         async def main() -> None:
@@ -256,7 +255,12 @@ def _run_subscriber_in_thread(
 
     t = _RealThread(target=runner, daemon=True)
     t.start()
-    return t
+    try:
+        assert ready_evt.wait(2.0)
+        yield
+    finally:
+        stop_evt.set()
+        t.join(timeout=3)
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
@@ -295,13 +299,8 @@ class TestPubSubIntegration:
     def test_roundtrip_default_serializer(self):
         addr = _make_addr()
         bucket: list[tuple[str, Any]] = []
-        ready = threading.Event()
-        stop = threading.Event()
-        thread = _run_subscriber_in_thread(addr, {"v1.snap.": bucket}, ready, stop)
-        try:
-            assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+        with _subscriber_thread(addr, {"v1.snap.": bucket}):
+            with ProcessPublisher(addr) as pub:
                 # Give SUB a moment to actually establish its connection so
                 # the very first message is not lost (PUB drops without peer).
                 gevent.sleep(0.2)
@@ -312,11 +311,6 @@ class TestPubSubIntegration:
                 payloads = [p for _, p in bucket]
                 assert all(t == "v1.snap.AAPL" for t in topics)
                 assert payloads == [{"i": i} for i in range(5)]
-            finally:
-                pub.close()
-        finally:
-            stop.set()
-            thread.join(timeout=3)
 
     def test_prefix_routing_and_multiple_handlers(self):
         addr = _make_addr()
@@ -357,8 +351,7 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.snap.AAPL", {"price": 1})
                 pub.publish("v1.heartbeat.gevent", {"ts": 123})
@@ -372,8 +365,6 @@ class TestPubSubIntegration:
                 # Verify unmatched topic was NOT delivered to any handler.
                 gevent.sleep(0.1)
                 assert all("unmatched" not in t for t, _ in snap + snap2 + hb)
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -384,25 +375,14 @@ class TestPubSubIntegration:
         not-yet-flagged subscriber and silently drop all messages."""
         addr = _make_addr()
         got: list[tuple[str, Any]] = []
-        ready = threading.Event()
-        stop = threading.Event()
-        thread = _run_subscriber_in_thread(
-            addr, {"v1.": got}, ready, stop,
-            task_factory=asyncio.eager_task_factory,
-        )
-        try:
-            assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+        with _subscriber_thread(
+            addr, {"v1.": got}, task_factory=asyncio.eager_task_factory
+        ):
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.snap", {"n": 1})
                 assert _wait_until(lambda: len(got) >= 1)
                 assert got == [("v1.snap", {"n": 1})]
-            finally:
-                pub.close()
-        finally:
-            stop.set()
-            thread.join(timeout=3)
 
     def test_handler_exception_does_not_kill_reader(self):
         addr = _make_addr()
@@ -436,15 +416,12 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 for i in range(3):
                     pub.publish("v1.x.k", {"i": i})
                 assert _wait_until(lambda: len(good) >= 3)
                 assert good == [("v1.x.k", {"i": i}) for i in range(3)]
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -482,8 +459,7 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.x.k", {"i": 0})
                 assert _wait_until(lambda: len(bucket) >= 1)
@@ -496,8 +472,6 @@ class TestPubSubIntegration:
                     pub.publish("v1.x.k", {"i": i + 1})
                 gevent.sleep(0.3)
                 assert len(bucket) == pre_count
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -535,8 +509,7 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.x.k", {"i": 1})
                 assert _wait_until(lambda: captured.get("entered", False), timeout=3.0)
@@ -545,8 +518,6 @@ class TestPubSubIntegration:
                 assert captured["after_close_sock"] is None
                 assert captured["after_close_ctx"] is None
                 assert captured["after_close_started"] is False
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -593,14 +564,11 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.x.k", {"i": 1})
                 # Sibling must complete, not get torn down by close()'s cancel.
                 assert _wait_until(sibling_finished.is_set, timeout=3.0)
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -638,15 +606,12 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 for i in range(3):
                     pub.publish("v1.x.k", {"i": i})
                 assert _wait_until(lambda: len(good) >= 3, timeout=3.0)
                 assert good == [("v1.x.k", {"i": i}) for i in range(3)]
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -686,8 +651,7 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.x.k", {"i": 1})
                 assert _wait_until(lambda: len(bucket) >= 1)
@@ -698,8 +662,6 @@ class TestPubSubIntegration:
                 assert _wait_until(lambda: len(bucket) >= 2, timeout=3.0)
                 assert bucket[0] == ("v1.x.k", {"i": 1})
                 assert bucket[1] == ("v1.x.k", {"i": 2})
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -749,8 +711,7 @@ class TestPubSubIntegration:
         thread.start()
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr).start()
-            try:
+            with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.x.k", {"i": 0})
                 assert _wait_until(restarted.is_set, timeout=3.0)
@@ -764,8 +725,6 @@ class TestPubSubIntegration:
                 pub.publish("v1.x.k", {"i": 1})
                 assert _wait_until(lambda: len(bucket) >= 2, timeout=3.0)
                 assert bucket[1] == ("v1.x.k", {"i": 1})
-            finally:
-                pub.close()
         finally:
             stop.set()
             thread.join(timeout=3)
@@ -773,28 +732,12 @@ class TestPubSubIntegration:
     def test_custom_serializer_end_to_end(self):
         addr = _make_addr()
         bucket: list[tuple[str, Any]] = []
-        ready = threading.Event()
-        stop = threading.Event()
-        thread = _run_subscriber_in_thread(
-            addr,
-            {"v1.json.": bucket},
-            ready,
-            stop,
-            serializer=JSONSerializer,
-        )
-        try:
-            assert ready.wait(2.0)
-            pub = ProcessPublisher(addr, serializer=JSONSerializer).start()
-            try:
+        with _subscriber_thread(addr, {"v1.json.": bucket}, serializer=JSONSerializer):
+            with ProcessPublisher(addr, serializer=JSONSerializer) as pub:
                 gevent.sleep(0.2)
                 pub.publish("v1.json.x", {"a": 1, "b": [1, 2, 3]})
                 assert _wait_until(lambda: len(bucket) >= 1)
                 assert bucket == [("v1.json.x", {"a": 1, "b": [1, 2, 3]})]
-            finally:
-                pub.close()
-        finally:
-            stop.set()
-            thread.join(timeout=3)
 
 
 # ---------------------------------------------------------------------------
@@ -872,15 +815,12 @@ class TestRuntimeMatrix:
         sub_t = _async_sub_in_thread(addr, "v1.", bucket, ready, stop)
         try:
             assert ready.wait(2.0)
-            pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
-            try:
+            with ProcessPublisher(addr, runtime=Runtime.GEVENT) as pub:
                 for i in range(100):
                     pub.publish("v1.x", {"i": i})
                     gevent.sleep(0.05)
                     if bucket:
                         break
-            finally:
-                pub.close()
         finally:
             stop.set()
             sub_t.join(3)
@@ -899,15 +839,12 @@ class TestRuntimeMatrix:
             assert ready.wait(2.0)
 
             async def producer():
-                pub = ProcessPublisher(addr, runtime=Runtime.ASYNC).start()
-                try:
+                async with ProcessPublisher(addr, runtime=Runtime.ASYNC) as pub:
                     for i in range(100):
                         await pub.publish("v1.x", {"i": i})
                         await asyncio.sleep(0.05)
                         if bucket:
                             break
-                finally:
-                    await pub.close()
 
             asyncio.run(producer())
         finally:
@@ -959,15 +896,12 @@ class TestRuntimeMatrix:
         sub.subscribe("v1.", handler)
         sub.start()
         try:
-            pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
-            try:
+            with ProcessPublisher(addr, runtime=Runtime.GEVENT) as pub:
                 for i in range(100):
                     pub.publish("v1.x", {"i": i})
                     gevent.sleep(0.05)
                     if bucket:
                         break
-            finally:
-                pub.close()
         finally:
             sub.close()
 
