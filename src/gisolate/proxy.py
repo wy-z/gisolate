@@ -62,6 +62,10 @@ def _proc_exited(process: Any) -> bool:
         return True  # sentinel closed/invalid: no live child behind it
 
 
+def _attached_client_factory() -> Any:
+    raise RuntimeError("an attached proxy does not build a client; the host does")
+
+
 class ProcessProxy(abc.ABC):
     """Proxy executing operations in an isolated child process via ZMQ IPC.
 
@@ -86,6 +90,9 @@ class ProcessProxy(abc.ABC):
     auto_restart_threshold: int = 6
     restart_cooldown: float = 6.0
     alive_check_idle_cycles: int = 10
+    # Set by attach(): the address of a worker this proxy talks to but does not
+    # own. None means the usual thing — spawn a child at a private address.
+    _attach_address: str | None = None
 
     @staticmethod
     @abc.abstractmethod
@@ -110,6 +117,10 @@ class ProcessProxy(abc.ABC):
         self._ctx: Any = None
         self._sock: Any = None
         self._addr: str | None = None
+        # Ownership is fixed at construction, never inferred from live state:
+        # `_process is None` is also true for an owner mid-restart, and the two
+        # cases differ in what teardown is allowed to touch.
+        self._owns_worker = type(self)._attach_address is None
         hub.ensure_hub_started()
         self._start()
 
@@ -124,32 +135,43 @@ class ProcessProxy(abc.ABC):
 
         self._owner = _internal.current_thread()
         with self._lock:
-            if self._shutdown or self._process is not None:
+            # The socket, not the process, says whether we are up: an attached
+            # proxy has no process and still has everything it owns.
+            if self._shutdown or self._sock is not None:
                 return
 
             cls = type(self)
-            self._addr = f"ipc://{_ZMQ_TMPDIR}/gi-{uuid.uuid4().hex[:16]}.sock"
+            self._addr = (
+                f"ipc://{_ZMQ_TMPDIR}/gi-{uuid.uuid4().hex[:16]}.sock"
+                if cls._attach_address is None
+                else cls._attach_address
+            )
             self._ctx = zmq_green.Context()
             self._sock = self._ctx.socket(zmq_green.DEALER)
             self._sock.setsockopt(zmq.LINGER, 0)
             self._sock.connect(self._addr)
 
-            config = _workers.WorkerConfig(
-                ipc_addr=self._addr,
-                factory_bytes=dill.dumps(cls.client_factory),
-                max_concurrency=cls.max_concurrency,
-            )
-            worker, args = (
-                (_workers.gevent_worker, (config, cls.patch_kwargs))
-                if cls.patch_kwargs is not None
-                else (_workers.asyncio_worker, (config,))
-            )
+            if self._owns_worker:
+                config = _workers.WorkerConfig(
+                    ipc_addr=self._addr,
+                    factory_bytes=dill.dumps(cls.client_factory),
+                    max_concurrency=cls.max_concurrency,
+                )
+                worker, args = (
+                    (_workers.gevent_worker, (config, cls.patch_kwargs))
+                    if cls.patch_kwargs is not None
+                    else (_workers.asyncio_worker, (config,))
+                )
 
-            mp_ctx = cls.mp_context or get_default_mp_context()
-            self._process = mp_ctx.Process(target=worker, daemon=cls.daemon, args=args)
-            with _internal.suppress_main_reimport():
-                self._process.start()
-            log.info(f"ProcessProxy started: pid={self._process.pid}, ctx={mp_ctx}")
+                mp_ctx = cls.mp_context or get_default_mp_context()
+                self._process = mp_ctx.Process(
+                    target=worker, daemon=cls.daemon, args=args
+                )
+                with _internal.suppress_main_reimport():
+                    self._process.start()
+                log.info(f"ProcessProxy started: pid={self._process.pid}, ctx={mp_ctx}")
+            else:
+                log.info(f"ProcessProxy attached: {self._addr}")
             self._reader = gevent.spawn(self._read_loop)
             self._error_count = 0
 
@@ -166,7 +188,7 @@ class ProcessProxy(abc.ABC):
         fall back to terminate/kill.
         """
         with self._lock:
-            if self._process is None:
+            if self._process is None and self._sock is None:
                 return
             reader, self._reader = self._reader, None
             process, self._process = self._process, None
@@ -184,7 +206,10 @@ class ProcessProxy(abc.ABC):
                 # deadline — it must propagate, not be suppressed.
                 reader.kill(block=True, timeout=timeout)
 
-            if sock is not None:
+            # Only the owner may end the worker: the frame makes it exit, and an
+            # attached proxy shares that worker with every other process attached
+            # to it — one client leaving would take it down for all of them.
+            if sock is not None and self._owns_worker:
                 # Best-effort SHUTDOWN, sent before the socket closes so the
                 # worker can drain + close its client (close(linger=0) would
                 # drop an unsent frame). NOBLOCK: a blocking send would hang
@@ -193,7 +218,7 @@ class ProcessProxy(abc.ABC):
                 # below handles it.
                 with contextlib.suppress(zmq.ZMQError):
                     sock.send_multipart([b"0", _workers.SHUTDOWN], zmq.NOBLOCK)
-            if graceful:
+            if graceful and process is not None:
                 # Give the child up to ``timeout`` to drain in-flight calls
                 # and exit on the SHUTDOWN frame, before terminate/kill cuts
                 # it short.
@@ -209,8 +234,11 @@ class ProcessProxy(abc.ABC):
             # gevent switch points too, so run teardown on its own greenlet: it
             # completes even if our join() below is interrupted mid-reap.
             def _teardown():
-                self._cleanup_zmq(sock, ctx, addr)
-                self._cleanup_process(process)
+                # The ipc file belongs to whoever bound it: unlink only what we
+                # spawned, never a host's socket other clients still use.
+                self._cleanup_zmq(sock, ctx, addr if self._owns_worker else None)
+                if process is not None:
+                    self._cleanup_process(process)
                 err = error or _internal.ProcessError("Process stopped")
                 for ar in pending:
                     ar.set_exception(err)
@@ -245,12 +273,24 @@ class ProcessProxy(abc.ABC):
             process.join(timeout=0.5)
 
     def _is_alive(self) -> bool:
+        if not self._owns_worker:
+            # Not remote liveness — that is not ours to read, and a host may be
+            # restarted under us without our help (the DEALER reconnects on its
+            # own; a host that is simply gone surfaces as an RPC timeout). What
+            # this answers is whether our LOCAL transport can still complete a
+            # call: an open socket whose reader greenlet died never will.
+            reader = self._reader
+            return self._sock is not None and reader is not None and not reader.dead
         # Single read: a concurrent _stop may null _process between checks.
         p = self._process
         return p is not None and not _proc_exited(p)
 
     def restart_process(self) -> None:
-        """Kill and restart child process. Thread-safe (marshals to main hub)."""
+        """Kill and restart the child process. Thread-safe (marshals to main hub).
+
+        An attached proxy owns no process: this rebuilds its socket and reader
+        and leaves the host serving.
+        """
         if not gevent.get_hub().loop.default:
             return hub.run_on_main_hub(self.restart_process)
         with self._lock:
@@ -258,8 +298,10 @@ class ProcessProxy(abc.ABC):
             # Uniform cooldown, dead child included: a client that crashes
             # during startup would otherwise respawn on every execute.
             # Callers aren't stranded — _ensure_running fails fast on a
-            # skipped restart, and _stop flushes pending waiters.
-            if now - self._last_restart < self.restart_cooldown:
+            # skipped restart, and _stop flushes pending waiters. Owners only:
+            # an attached restart spawns nothing, it rebuilds a socket, so
+            # throttling it only strands the client for the cooldown.
+            if self._owns_worker and now - self._last_restart < self.restart_cooldown:
                 log.warning("Restart skipped (cooldown)")
                 return
             self._last_restart = now
@@ -315,7 +357,7 @@ class ProcessProxy(abc.ABC):
                 if idle_cycles >= self.alive_check_idle_cycles and not self._is_alive():
                     break
             if not self._shutdown:
-                log.warning("Child process died, stopping reader")
+                log.warning("Worker unreachable, stopping reader")
         except (gevent.GreenletExit, zmq.ZMQError):
             pass
         except Exception as e:
@@ -419,7 +461,15 @@ class ProcessProxy(abc.ABC):
         is_owner: bool,
     ) -> Exception | None:
         try:
-            payload = _internal.SmartPickle.dumps((method, args, kwargs, rpc_timeout))
+            # An absolute deadline, not a relative budget: the request may sit
+            # in the DEALER's queue arbitrarily long before any worker receives
+            # it (attach() connects to an address nobody has bound yet), and a
+            # worker that re-based the budget at receipt would run a call whose
+            # caller gave up long ago. Same-host monotonic clock, which ipc://
+            # guarantees.
+            payload = _internal.SmartPickle.dumps(
+                (method, args, kwargs, time.monotonic() + rpc_timeout)
+            )
             frames = [req_id.to_bytes(8), payload]
             # The zmq.green socket is owned by the main hub (where the reader
             # greenlet recv()s). Sending from the owner (main) thread shares
@@ -510,6 +560,42 @@ class ProcessProxy(abc.ABC):
             ns["mp_context"] = mp_context
         klass = type(f"ProcessProxy<{factory.__qualname__}>", (cls,), ns)
         return klass()  # type: ignore[return-value]
+
+    @classmethod
+    def attach(cls, address: str, *, timeout: float = 24) -> "ProcessProxy":
+        """Proxy a worker this process does not own — see :func:`gisolate.serve`.
+
+        Nothing is spawned: the proxy connects to *address* and shares that
+        worker with every other process attached to it, so an isolated library is
+        resident once per host instead of once per client. The host owns the
+        lifecycle — ``shutdown()`` here closes this client's sockets and leaves
+        the worker serving.
+
+        Attaching is asynchronous and proves nothing about the far end: ZMQ
+        connects to an address nobody has bound yet just as happily, a host that
+        restarts is picked up again by the DEALER's own reconnect, and a host
+        that is simply absent surfaces as an RPC timeout rather than as a failure
+        here. Like any ZMQ socket the proxy is process-local, so a forking server
+        must attach AFTER the fork, once per worker.
+
+        Args:
+            address: the ``ipc://`` address the host bound — same host only, for
+                the reasons :func:`gisolate.serve` documents.
+            timeout: Per-call timeout in seconds.
+        """
+        _internal.require_ipc(address, "ProcessProxy.attach()")
+        klass = type(
+            "ProcessProxy<attached>",
+            (cls,),
+            {
+                # Never called: the host built the client. Present only because
+                # the base class declares it abstract.
+                "client_factory": staticmethod(_attached_client_factory),
+                "timeout": timeout,
+                "_attach_address": address,
+            },
+        )
+        return klass()
 
 
 class _TimeoutView:

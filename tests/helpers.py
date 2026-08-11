@@ -1,5 +1,6 @@
 """Shared test helpers — importable by child processes (must be top-level picklable)."""
 
+import contextlib
 import os
 import threading
 
@@ -218,3 +219,87 @@ def suicide():
     import signal
 
     os.kill(os.getpid(), signal.SIGKILL)
+
+
+def serve_adder(address, patch_kwargs=None):
+    """Host entry point: this process BECOMES the worker (see gisolate.serve)."""
+    import gisolate
+
+    gisolate.serve(adder_factory, address, patch_kwargs=patch_kwargs)
+
+
+class Marker:
+    """Records every call it runs, so a test can prove one did NOT run."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def mark(self):
+        with open(self.path, "a") as f:
+            f.write("ran\n")
+
+    def ping(self):
+        return "pong"
+
+
+def serve_marker(address, path):
+    """Host entry point serving a Marker (see gisolate.serve).
+
+    One slot on purpose: a later call cannot answer while an earlier one is
+    still running, which lets a test use a reply as a barrier.
+    """
+    import functools
+
+    import gisolate
+
+    gisolate.serve(functools.partial(Marker, path), address, max_concurrency=1)
+
+
+@contextlib.contextmanager
+def host_process(spawn_ctx, target, address, *args):
+    """Run a serve() host for the duration of a test.
+
+    The host binds a fixed path and nothing in gisolate unlinks it — an
+    attached client must not, and a terminated host cannot — so the test that
+    chose the path is what clears it.
+    """
+    from gisolate.proxy import _proc_exited
+
+    proc = spawn_ctx.Process(target=target, args=(address, *args), daemon=True)
+    proc.start()
+    try:
+        yield proc
+    finally:
+        # Sentinel-gated like ProcessProxy._cleanup_process, and for the same
+        # reason: under a gevent parent the child's reap can be stolen, leaving
+        # is_alive() true over a pid that now belongs to someone else.
+        if not _proc_exited(proc):
+            proc.terminate()
+            proc.join(timeout=5)
+        if not _proc_exited(proc):
+            proc.kill()
+            proc.join(timeout=5)
+        # Never unlink out from under a live host: the next test picks a fresh
+        # path, so a survivor would linger unnamed and unnoticed.
+        if _proc_exited(proc):
+            with contextlib.suppress(OSError):
+                os.unlink(address.removeprefix("ipc://"))
+
+
+def wait_bound(proxy, timeout=10):
+    """Block until the worker has bound its socket.
+
+    Call deadlines are stamped by the caller, so on a cold proxy the child's
+    startup spends the budget of the very first call. A test that needs a short
+    deadline to land somewhere specific (inside a slow connect(), say) has to
+    wait out the boot first, or it measures process startup instead.
+    """
+    import time
+
+    import gevent
+
+    path = proxy._addr.removeprefix("ipc://")
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        assert time.monotonic() < deadline, "worker never bound its socket"
+        gevent.sleep(0.02)

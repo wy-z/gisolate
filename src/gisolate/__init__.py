@@ -13,6 +13,7 @@ from .local import ThreadLocalProxy
 from .proxy import ProcessProxy, get_default_mp_context, set_default_mp_context
 from .pubsub import ProcessPublisher, ProcessSubscriber
 from .pubsub import Runtime as PubSubRuntime
+from .server import serve
 from .subprocess import run_in_subprocess
 
 # Pre-initialize threadpoolctl on main thread to cache library info.
@@ -37,6 +38,7 @@ __all__ = [
     "ensure_hub_started",
     "get_default_mp_context",
     "run_in_subprocess",
+    "serve",
     "set_default_mp_context",
     "shutdown_hub",
     "spawn_on_main_hub",

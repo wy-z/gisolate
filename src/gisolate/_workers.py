@@ -43,6 +43,25 @@ def safe_close(client: Any) -> None:
             close()
 
 
+def bind_or_close(ctx: Any, sock: Any, addr: str) -> None:
+    """Bind, or tear the transport down before letting the error out.
+
+    A spawned child dies with its leak, but serve() runs the worker inside a
+    process that survives the exception — an unclosed context there outlives
+    the failure and wedges the next term().
+    """
+    try:
+        sock.bind(addr)
+    except BaseException:
+        # Independently best-effort: the bind error is the diagnostic, and a
+        # failing close must neither replace it nor cost us the term().
+        with contextlib.suppress(Exception):
+            sock.close(linger=0)
+        with contextlib.suppress(Exception):
+            ctx.term()
+        raise
+
+
 def _malformed(exc: Exception) -> Exception:
     """Wrap a request-parse failure as a serializable error response."""
     return _internal.wrap_exception(
@@ -66,11 +85,9 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
 
     gevent.get_hub()
 
-    ctx = zmq_green.Context()
-    sock = ctx.socket(zmq_green.ROUTER)
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.bind(cfg.ipc_addr)
-
+    # Everything that can fail is built before the transport exists, so no
+    # failure here can strand a bound socket outside the cleanup below —
+    # serve() runs this in a process that survives the exception.
     factory = dill.loads(cfg.factory_bytes)
     client = None
     client_lock = gevent.lock.RLock()
@@ -79,6 +96,11 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     # handle() with a deadline, so saturation can never block _drain.
     handlers = gevent.pool.Group()
     slots = gevent.lock.Semaphore(cfg.max_concurrency) if cfg.max_concurrency else None
+
+    ctx = zmq_green.Context()
+    sock = ctx.socket(zmq_green.ROUTER)
+    sock.setsockopt(zmq.LINGER, 0)
+    bind_or_close(ctx, sock, cfg.ipc_addr)
 
     def send(identity: bytes, req_id: bytes, ok: bool, data: Any):
         resp, ok = safe_dumps(data, ok)
@@ -170,21 +192,16 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
             if payload == SHUTDOWN:
                 return False
             try:
-                method, args, kwargs, timeout = _internal.SmartPickle.loads(payload)
+                method, args, kwargs, deadline = _internal.SmartPickle.loads(payload)
             except Exception as e:
                 send(identity, req_id, False, _malformed(e))
                 continue
-            handlers.spawn(
-                handle, identity, req_id, method, args, kwargs,
-                time.monotonic() + timeout,
-            )
+            handlers.spawn(handle, identity, req_id, method, args, kwargs, deadline)
 
     try:
         while True:
             if sock.poll(500) and not _drain():
                 break
-    except zmq.ZMQError:
-        pass
     finally:
         handlers.join(timeout=6)
         safe_close(client)
@@ -307,7 +324,7 @@ def asyncio_worker(cfg: WorkerConfig):
         ctx = zmq.asyncio.Context()
         sock = ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 0)
-        sock.bind(cfg.ipc_addr)
+        bind_or_close(ctx, sock, cfg.ipc_addr)
         poller = zmq.asyncio.Poller()
         poller.register(sock, zmq.POLLIN)
 
@@ -322,15 +339,12 @@ def asyncio_worker(cfg: WorkerConfig):
                 if payload == SHUTDOWN:
                     break
                 try:
-                    method, args, kwargs, timeout = _internal.SmartPickle.loads(payload)
+                    method, args, kwargs, deadline = _internal.SmartPickle.loads(payload)
                 except Exception as e:
                     await send(sock, identity, req_id, False, _malformed(e))
                     continue
                 task = asyncio.create_task(
-                    handle(
-                        sock, identity, req_id, method, args, kwargs,
-                        time.monotonic() + timeout,
-                    )
+                    handle(sock, identity, req_id, method, args, kwargs, deadline)
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
@@ -342,7 +356,4 @@ def asyncio_worker(cfg: WorkerConfig):
             sock.close(linger=0)
             ctx.term()
 
-    try:
-        asyncio.run(main())
-    except zmq.ZMQError:
-        pass
+    asyncio.run(main())

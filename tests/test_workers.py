@@ -1,6 +1,33 @@
 """Tests for gisolate._workers module."""
 
-from gisolate._workers import ERR, OK, SHUTDOWN, safe_close
+import pytest
+import zmq
+
+from gisolate._workers import ERR, OK, SHUTDOWN, bind_or_close, safe_close
+
+
+class TestBindOrClose:
+    def test_a_failed_bind_takes_the_transport_with_it(self):
+        """serve() runs the worker in a process that survives the error, so a
+        context left open here wedges its next term() — that leak hung a whole
+        test session once."""
+        closed, termed = [], []
+
+        class Sock:
+            def bind(self, addr):
+                raise zmq.ZMQError(zmq.EINVAL)
+
+            def close(self, linger=None):
+                closed.append(linger)
+
+        class Ctx:
+            def term(self):
+                termed.append(True)
+
+        with pytest.raises(zmq.ZMQError):
+            bind_or_close(Ctx(), Sock(), "ipc:///whatever")
+        assert closed == [0]
+        assert termed == [True]
 
 
 class TestMarkers:
