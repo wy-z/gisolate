@@ -36,6 +36,7 @@ All source lives in `src/gisolate/`. Key modules:
 - **`proxy.py`** — `ProcessProxy`: the main abstraction. Subclass it, implement `client_factory()`, and method calls are transparently forwarded to an isolated child process via ZMQ DEALER/ROUTER sockets. Supports both gevent and asyncio child workers. Use `ProcessProxy.create()` for quick one-off proxies without subclassing.
 - **`_workers.py`** — Child process entry points: `gevent_worker` (with monkey-patching) and `asyncio_worker`. Selected based on whether `patch_kwargs` is set on the proxy class.
 - **`bridge.py`** — `ProcessBridge`: lower-level ZMQ RPC bridge for cross-process function calls (server=gevent ROUTER, client=asyncio DEALER). Unlike ProcessProxy, this sends arbitrary callables rather than method names.
+- **`server.py`** — `serve()`: run the worker loop in THIS process at a fixed address, so several client processes can `ProcessProxy.attach()` to one worker instead of each spawning its own.
 - **`pubsub.py`** — `ProcessPublisher` / `ProcessSubscriber`: one-way ZMQ PUB/SUB fan-out with topic-prefix handlers. Each side picks its runtime (gevent or asyncio) via the `runtime` kwarg; wire format is runtime-agnostic.
 - **`subprocess.py`** — `run_in_subprocess()`: simple one-shot function execution in a subprocess with gevent-safe polling via `multiprocessing.Pipe`.
 - **`local.py`** — `ThreadLocalProxy`: proxy with true thread-local isolation using unpatched `threading.local`.

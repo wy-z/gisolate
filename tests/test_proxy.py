@@ -27,6 +27,7 @@ from .helpers import (
     swallower_factory,
     tracker_factory,
     unprintable_factory,
+    wait_bound,
 )
 
 
@@ -104,6 +105,7 @@ class TestProcessProxyCreate:
         """A per-call deadline cancelling the client's async connect() must
         not cache the half-connected client — the next call rebuilds it."""
         with ProcessProxy.create(slow_connect_factory, timeout=10) as proxy:
+            wait_bound(proxy)  # else the 0.3s is spent on child startup
             with pytest.raises(TimeoutError):
                 proxy.with_timeout(0.3).is_ready()
             assert proxy.is_ready() is True
@@ -112,6 +114,7 @@ class TestProcessProxyCreate:
         """The half-connected client abandoned by a deadline-cancelled
         connect() must be close()d in the child, not leaked."""
         with ProcessProxy.create(slow_connect_factory, timeout=10) as proxy:
+            wait_bound(proxy)  # else the 0.3s is spent on child startup
             with pytest.raises(TimeoutError):
                 proxy.with_timeout(0.3).close_count()
             assert proxy.close_count() == 1

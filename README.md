@@ -47,6 +47,45 @@ with ClientProxy() as proxy:
     result = proxy.query("SELECT 1")
 ```
 
+### serve / attach — one worker, many client processes
+
+A `ProcessProxy` spawns a worker at a random address it never advertises, so N
+client processes pay for N copies of the isolated library. Where that matters (several gunicorn workers in
+one container, say), one process hosts the worker and the rest attach to it:
+
+```python
+# Host process — becomes the worker; blocks.
+import os
+from gisolate import serve
+
+os.makedirs("/run/myapp", exist_ok=True)
+os.chmod("/run/myapp", 0o700)   # mode= on makedirs only applies when it creates
+serve(create_client, "ipc:///run/myapp/client.sock")
+```
+
+```python
+# Every client process — no spawn, no factory.
+from gisolate import ProcessProxy
+
+proxy = ProcessProxy.attach("ipc:///run/myapp/client.sock", timeout=10)
+result = proxy.query("SELECT 1")   # runs in the host
+proxy.shutdown()                   # closes this client only; the host keeps serving
+```
+
+**Put the socket in a directory you control.** The wire is unauthenticated
+pickle and an empty frame stops the worker, so anyone who can connect can run
+code in the host or shut it down for every client. The socket file's own mode
+follows the host's umask — a world-writable one in a shared directory like
+`/tmp` is reachable by any local user — whereas a `0700` directory is not,
+whatever the umask. `ipc://` only, and same host only: a call carries the
+caller's monotonic deadline, which means nothing on another machine's clock.
+
+Attaching is asynchronous: it connects to an address nobody has bound yet just as
+happily, a restarted host is picked up by the DEALER's own reconnect, and an
+absent one surfaces as an RPC timeout. The proxy is process-local like any ZMQ
+socket — a forking server attaches after the fork, once per worker. `serve()`'s
+`max_concurrency` bounds the worker, so it is shared by every client.
+
 ### run_in_subprocess — one-shot call
 
 Run a single function in a subprocess and get the result:
@@ -192,10 +231,16 @@ proxy = ProcessProxy.create(factory, patch_kwargs={"thread": False, "os": False}
 
 - **`ProcessProxy.create(factory, *, timeout=24, mp_context=None, patch_kwargs=None)`** — create a proxy without subclassing
 - **`proxy.<method>(*args, **kwargs)`** — transparently call any method on the remote object
-- **`proxy.restart_process()`** — kill and restart child process
+- **`ProcessProxy.attach(address, *, timeout=24)`** — proxy a worker hosted by `serve()`; never spawns, and `shutdown()` leaves the worker running
+- **`proxy.restart_process()`** — kill and restart the child process; on an attached proxy there is no process to kill, so it rebuilds the local transport instead
 - **`proxy.shutdown()`** — gracefully stop child process
 - Supports context manager (`with` statement)
 - Thread-safe: usable from greenlets and native threads
+
+### `serve(factory, address, *, patch_kwargs=None, max_concurrency=None)`
+
+Turn this process into the worker, bound to *address*, for clients that
+`ProcessProxy.attach()`. Blocks until interrupted or terminated.
 
 ### `run_in_subprocess(target, args=(), kwargs=None, *, timeout=3600, mp_context=None)`
 

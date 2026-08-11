@@ -116,6 +116,25 @@ def suppress_main_reimport():
         mp_spawn.get_preparation_data = orig  # type: ignore[assignment]
 
 
+def require_ipc(address: str, who: str) -> None:
+    """Reject a shared-worker address that is not an absolute ipc:// path.
+
+    A call carries the caller's monotonic deadline and the payload is plain
+    pickle — both are only meaningful between processes on one machine, under
+    one privilege. A ``tcp://`` peer whose clock runs behind ours would honour
+    requests the caller has already abandoned, and would let anyone who can
+    reach the port deserialize into the host.
+
+    Absolute, because the only protection on offer is the directory's: Linux
+    abstract endpoints (``ipc://@name``) have no filesystem entry to protect,
+    and a relative path names a different socket per working directory.
+    """
+    if not address.startswith("ipc:///"):
+        raise ValueError(
+            f"{who} supports absolute ipc:/// addresses only, got {address!r}"
+        )
+
+
 def wrap_exception(e: BaseException, tb_str: str | None = None) -> Exception:
     """Ensure exception survives serialization round-trip, attach remote traceback."""
     exc: Exception | None = None
