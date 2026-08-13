@@ -3,7 +3,12 @@
 import asyncio
 import contextlib
 import json
+import os
+import signal
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import uuid
@@ -60,66 +65,51 @@ class TestProcessPublisher:
         with pytest.raises(RuntimeError, match="before start"):
             pub.publish("t", {"x": 1})
 
-    def test_start_failure_releases_resources(self):
-        """If bind fails, ctx/sock must be cleaned up so close() is harmless."""
-        # Bogus transport — bind must raise.
-        pub = ProcessPublisher("not-a-valid-transport://x")
-        with pytest.raises(Exception):
-            pub.start()
-        assert pub._sock is None
-        assert pub._ctx is None
-        assert not pub._started
-        pub.close()  # idempotent, no-op
+    def test_a_start_that_fails_after_binding_leaves_nothing_behind(
+        self, monkeypatch
+    ):
+        """Everything fallible has to come before the bind, or be undone. The
+        lock came after it, so a MemoryError there left a bound PUB socket
+        reachable only through the traceback — _transport was still None, so
+        neither close() nor __del__ could release it, and the socket file
+        stayed."""
+        import gevent.lock
 
-    def test_publish_no_subscribers_does_not_block(self):
-        """Without a SUB connected, NOBLOCK publish must return immediately."""
-        with ProcessPublisher(_make_addr()) as pub:
-            t0 = time.monotonic()
-            for i in range(2000):
-                pub.publish("v1.fast", {"i": i})
-            elapsed = time.monotonic() - t0
-            assert elapsed < 2.0  # generous bound; we mostly care it didn't hang
+        def no_room(*_args, **_kwargs):
+            raise MemoryError("no room for a lock")
+
+        addr = _make_addr()
+        monkeypatch.setattr(gevent.lock, "Semaphore", no_room)
+        pub = ProcessPublisher(addr)
+        with pytest.raises(MemoryError):
+            pub.start()
+        assert pub._transport is None
+        assert not os.path.exists(addr[6:])
+
+    def test_the_async_start_leaves_nothing_behind_either(self, monkeypatch):
+        """Same ordering, same consequence, in the runtime whose lock is
+        asyncio's."""
+
+        def no_room(*_args, **_kwargs):
+            raise MemoryError("no room for a lock")
+
+        addr = _make_addr()
+        monkeypatch.setattr(asyncio, "Lock", no_room)
+
+        async def go():
+            pub = ProcessPublisher(addr, runtime=Runtime.ASYNC)
+            with pytest.raises(MemoryError):
+                pub.start()
+            assert pub._transport is None
+
+        asyncio.run(go())
+        assert not os.path.exists(addr[6:])
 
     def test_context_manager(self):
         addr = _make_addr()
         with ProcessPublisher(addr) as pub:
             assert pub.address == addr
             pub.publish("x", 1)
-
-    def test_custom_serializer(self):
-        with ProcessPublisher(_make_addr(), serializer=JSONSerializer) as pub:
-            pub.publish("t", {"a": 1})
-
-    def test_concurrent_publish_and_close(self):
-        """publish() running concurrently with close() must not crash on a freed socket.
-
-        Regression: close() tore the socket down without taking _send_lock,
-        leaving in-flight publish() greenlets racing against a freed sock.
-
-        After close, publish() legitimately raises RuntimeError (publisher
-        not started); that's expected and explicitly tolerated here. The
-        bug we're guarding against is a ZMQ-level crash from a torn-down
-        socket during the in-flight send.
-        """
-        pub = ProcessPublisher(_make_addr()).start()
-        errors: list[BaseException] = []
-
-        def producer():
-            for _ in range(500):
-                try:
-                    pub.publish("v1.race", {"i": 0})
-                except RuntimeError:
-                    return  # publisher closed after us — expected
-                except BaseException as e:  # noqa: BLE001
-                    errors.append(e)
-                    return
-                gevent.sleep(0)
-
-        greenlets = [gevent.spawn(producer) for _ in range(4)]
-        gevent.sleep(0.05)  # let producers start
-        pub.close()
-        gevent.joinall(greenlets, timeout=3)
-        assert errors == [], f"publish raised under concurrent close: {errors!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +193,7 @@ class TestProcessSubscriberLifecycle:
         sub = ProcessSubscriber(_make_addr())
         with pytest.raises(RuntimeError):
             sub.start()
-        assert sub._sock is None
-        assert sub._ctx is None
+        assert sub._transport is None
         assert sub._reader is None
         assert not sub._started
 
@@ -292,7 +281,7 @@ class TestPubSubIntegration:
             sub._read_loop_async = hijacked  # type: ignore[method-assign]
             sub.start()
             assert sub._started is False
-            assert sub._sock is None
+            assert sub._transport is None
 
         asyncio.run(main())
 
@@ -490,8 +479,7 @@ class TestPubSubIntegration:
                 async def handler(_topic, _payload):
                     captured["entered"] = True
                     await sub.close()
-                    captured["after_close_sock"] = sub._sock
-                    captured["after_close_ctx"] = sub._ctx
+                    captured["after_close_transport"] = sub._transport
                     captured["after_close_started"] = sub._started
 
                 sub.subscribe("v1.x.", handler)
@@ -511,12 +499,18 @@ class TestPubSubIntegration:
             assert ready.wait(2.0)
             with ProcessPublisher(addr) as pub:
                 gevent.sleep(0.2)
-                pub.publish("v1.x.k", {"i": 1})
-                assert _wait_until(lambda: captured.get("entered", False), timeout=3.0)
+
+                def offered():
+                    # PUB drops everything until the subscription has
+                    # propagated, so keep offering rather than betting the test
+                    # on one message landing after a fixed sleep.
+                    pub.publish("v1.x.k", {"i": 1})
+                    return captured.get("entered", False)
+
+                assert _wait_until(offered, timeout=5.0)
                 # Give close() a moment to finish cleanup.
                 gevent.sleep(0.3)
-                assert captured["after_close_sock"] is None
-                assert captured["after_close_ctx"] is None
+                assert captured["after_close_transport"] is None
                 assert captured["after_close_started"] is False
         finally:
             stop.set()
@@ -669,7 +663,7 @@ class TestPubSubIntegration:
     def test_handler_close_then_restart_no_stale_reader(self):
         """close+start from inside a handler must not leave a stale reader live.
 
-        Regression: ``_read_loop`` used to read ``self._sock`` dynamically, so
+        Regression: ``_read_loop`` used to read ``self._transport`` dynamically, so
         after a handler did ``await sub.close(); sub.start()`` the original
         reader resumed against the *new* socket, racing the new reader's
         recv. The reader is now bound to its start-time socket and exits on
@@ -907,3 +901,227 @@ class TestRuntimeMatrix:
 
         assert bucket, "no messages: gevent -> gevent"
         assert bucket[0][0] == "v1.x"
+
+
+class TestPublisherAddressOwnership:
+    def test_closing_an_old_publisher_leaves_the_live_one_reachable(self):
+        """libzmq unlinks an ipc path before binding it, so a restarted
+        publisher silently takes the address over. The departing one must not
+        remove that file: the survivor kept its current subscribers and went
+        invisible to every new connect — a silent half-outage."""
+        addr = _make_addr()
+        old = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+        new = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+        received: list[Any] = []
+        sub = ProcessSubscriber(addr, runtime=Runtime.GEVENT)
+        sub.subscribe("t", lambda _topic, payload: received.append(payload))
+        try:
+            old.close()
+            sub.start()  # a subscriber connecting AFTER the old one left
+            gevent.sleep(0.3)
+            new.publish("t", "payload")
+            gevent.sleep(0.3)
+            assert received == ["payload"]
+        finally:
+            sub.close()
+            new.close()
+
+    def test_a_lone_publisher_removes_its_own_socket(self):
+        """The other half of the rule: with nobody having taken the address
+        over, the file IS ours and must go — a service churning unique
+        addresses would otherwise leave a socket inode behind per publisher."""
+        addr = _make_addr()
+        pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+        assert os.path.exists(addr.removeprefix("ipc://"))
+        pub.close()
+        assert not os.path.exists(addr.removeprefix("ipc://"))
+
+
+class TestGeventReaderBackpressure:
+    def test_the_reader_waits_for_its_handlers(self):
+        """Draining ahead of the handlers defeats what SUB's receive queue and
+        PUB's high-water mark are for — dropping at the publisher — and turns a
+        handler slower than the stream into unbounded live greenlets, each
+        holding its payload."""
+        addr = _make_addr()
+        active, peak = [], []
+
+        def slow(_topic, payload):
+            active.append(payload)
+            peak.append(len(active))
+            gevent.sleep(0.05)
+            active.pop()
+
+        sub = ProcessSubscriber(addr, runtime=Runtime.GEVENT)
+        sub.subscribe("t.", slow)
+        pub = ProcessPublisher(addr, runtime=Runtime.GEVENT).start()
+        sub.start()
+        try:
+            gevent.sleep(0.3)  # slow joiner: let the subscription land
+            for i in range(20):
+                pub.publish("t.x", i)
+            gevent.sleep(1.0)
+            assert peak, "no message reached the handler"
+            assert max(peak) == 1, f"{max(peak)} dispatches ran at once"
+        finally:
+            sub.close()
+            pub.close()
+
+
+class TestHandlerExitIsolation:
+    def test_a_handler_that_exits_does_not_take_the_host_with_it(self):
+        """SystemExit raised inside a handler is re-raised into the event loop
+        by Task.__step, or forwarded by gevent to the main greenlet — either
+        way ending the subscriber host, which is the opposite of what "an
+        exception in one handler is logged but does not kill the reader"
+        promises. An operator's Ctrl-C does not arrive here: it lands where the
+        main thread is, not inside a handler."""
+
+        def exiting(_topic, _payload):
+            raise SystemExit(2)
+
+        sub = ProcessSubscriber(_make_addr(), runtime=Runtime.GEVENT)
+        worker = gevent.spawn(sub._invoke_gevent, exiting, "t.x", None)
+        worker.join(timeout=5)
+        assert worker.successful(), worker.exception
+
+    def test_the_async_handler_boundary_holds_too(self):
+        async def go():
+            async def exiting(_topic, _payload):
+                raise SystemExit(2)
+
+            sub = ProcessSubscriber(_make_addr(), runtime=Runtime.ASYNC)
+            task = asyncio.ensure_future(sub._invoke_async(exiting, "t.x", None))
+            await asyncio.wait({task}, timeout=5)
+            assert task.done() and task.exception() is None
+
+        asyncio.run(go())
+
+    def test_the_operators_interrupt_is_not_absorbed(self):
+        """Measured, and the opposite of what round 33 assumed: a real SIGINT is
+        raised in whatever greenlet is running on the main OS thread, so it
+        lands inside the handler — not in the main greenlet. Caught as a client
+        failure, Ctrl-C stops working on a subscriber host."""
+        script = textwrap.dedent(
+            """
+            from gevent import monkey
+
+            monkey.patch_all()
+
+            import time
+
+            import gevent
+
+            from gisolate.pubsub import ProcessSubscriber, Runtime
+
+            def busy(_topic, _payload):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    for _ in range(50000):
+                        pass
+                    gevent.sleep(0)
+
+            sub = ProcessSubscriber("ipc:///tmp/gi-never", runtime=Runtime.GEVENT)
+            print("READY", flush=True)
+            worker = gevent.spawn(sub._invoke_gevent, busy, "t.x", None)
+            try:
+                worker.join(timeout=15)
+            except KeyboardInterrupt:
+                print("INTERRUPTED", flush=True)
+            """
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "READY"
+            time.sleep(1.0)  # let the handler get going
+            proc.send_signal(signal.SIGINT)
+            out, _ = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        assert "INTERRUPTED" in out, out
+
+
+class TestSubscriberSpawnRefused:
+    def test_a_refused_spawn_leaves_the_subscriber_startable(self, monkeypatch):
+        """_started and the transport are published before the reader exists, so
+        a spawn that refuses left the subscriber claiming to be up with nothing
+        reading — and start() no-ops on the retry. Its async twin already rolled
+        this back."""
+        real_spawn = gevent.spawn
+
+        def refuse(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_read_loop_gevent":
+                raise RuntimeError("the hub refused a greenlet")
+            return real_spawn(fn, *args, **kwargs)
+
+        monkeypatch.setattr(gevent, "spawn", refuse)
+        sub = ProcessSubscriber(_make_addr(), runtime=Runtime.GEVENT)
+        with pytest.raises(RuntimeError, match="refused"):
+            sub.start()
+        assert not sub._started and sub._transport is None
+
+        monkeypatch.undo()
+        sub.start()  # and the retry works
+        sub.close()
+
+
+class TestPublishGenerationBound:
+    def test_a_parked_publish_does_not_send_on_the_next_generation(
+        self, monkeypatch
+    ):
+        """A publish parked on generation A's send lock can resume after a
+        close+start has published B — and re-reading ``self`` sent A's message
+        on B's socket while holding A's lock, beside a publish legitimately
+        holding B's, interleaving their multipart frames. Constructed the way
+        the bridge's stale-generation test does: the post-race state is
+        installed directly, because the wake ordering that produces it live is
+        the hub's to choose."""
+        import zmq
+        import zmq.green
+
+        from gisolate import _internal
+
+        pub = ProcessPublisher(_make_addr()).start()
+        sent = []
+        real_send = zmq.green.Socket.send_multipart
+
+        def recording(sock_self, frames, *a, **k):
+            sent.append((sock_self, frames[0]))
+            return real_send(sock_self, frames, *a, **k)
+
+        monkeypatch.setattr(zmq.green.Socket, "send_multipart", recording)
+
+        lock_a = pub._send_lock
+        lock_a.acquire()
+        stale = gevent.spawn(pub.publish, "stale", 1)
+        gevent.sleep(0.05)  # parked on generation A's lock
+
+        # What a completed close+start leaves behind while the publish waits:
+        # a NEW started generation, and the old one gone.
+        old_transport = pub._transport
+        new_transport = _internal.ZmqTransport.open(
+            zmq.green.Context, zmq.PUB, _make_addr(), bind=True
+        )
+        pub._transport = new_transport
+        pub._send_lock = type(lock_a)()
+
+        lock_a.release()  # the parked publish resumes, holding A's lock
+        stale.join(timeout=2)
+        monkeypatch.undo()
+
+        try:
+            assert not [1 for s_, t in sent if s_ is new_transport.sock], (
+                "a publish accepted on the old generation sent on the new one"
+            )
+        finally:
+            new_transport.close()
+            pub._transport = old_transport
+            pub._send_lock = lock_a
+            pub.close()

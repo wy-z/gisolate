@@ -325,6 +325,123 @@ if __name__ == "__main__":
 
 Spawn children re-import `main.py` but skip the `__name__` block, avoiding side effects.
 
+## Known limits
+
+These are decisions, not oversights — each one is documented at the site that
+lives with it, and each was reached by measuring the alternative.
+
+**A synchronous client method cannot be stopped (asyncio worker).** Sync methods,
+and a sync `factory()` or `connect()`, run on the default executor. Expiring a
+call's deadline cancels only the awaiting task: the thread runs to completion, so
+its side effects can land after the caller was told it timed out. Bounding it
+would need an executor of our own to join, which every correct client would pay
+for. `max_concurrency` bounds awaiting handlers; a client whose sync methods must
+not overlap needs its own lock. The gevent worker has no such gap — `kill()`
+lands inside client code at its next switch.
+
+**An asyncio handler's own cleanup can run after the client is closed.** The
+shutdown cancels outstanding handlers and disposes the client without waiting for
+them, so a handler's `finally` may touch an object that is already closed. Giving
+them a step first is worse, and was measured: a handler waiting on the client
+build resumes holding it and reaches `off_loop`, which submits the call to the
+executor *before* the await where the cancellation lands — running the very call
+the shutdown exists to prevent, and taking the thread the dispose then waits on.
+The gevent worker has no such trade: a kill lands at the handler's current switch
+point and starts nothing.
+
+**`serve()` has no hard shutdown bound (asyncio worker).** After the six-second
+drain, `asyncio.run` cancels what is left and waits for it with no timeout of its
+own, so a coroutine that swallows its cancellation holds the host open. A spawned
+`ProcessProxy` worker has the bound its parent's terminate/kill gives it; an
+in-process host does not. The teardown's own join of a pending client build is
+bounded at six seconds, after which that client is lost rather than closed.
+
+**Two microsecond windows on an `ipc://` socket file.** A replacement that binds
+between our bind and the claim's `stat` is recorded as ours; one that binds
+between release's `stat` and its `unlink` is removed by us. libzmq exposes no
+descriptor for the listening socket, so there is nothing to `fstat` instead of
+the path, and closing either window needs a lock protocol an address cannot
+carry. What the claim does buy is the difference between "wrong whenever anyone
+rebinds" and "wrong only inside that window".
+
+**A revival is not bounded by the call that triggered it.** When `execute()`
+finds the worker dead it rebuilds it, and the spawn takes what it takes — the
+call's deadline bounds the marshal, which is a queue we do not control, but not
+the shared work of starting a child. `restart_cooldown` bounds how often an owner
+pays for it.
+
+**`ProcessBridge` belongs to one thread.** `start()` and `close()` carry no
+synchronization, and the ZMQ socket, the serving greenlet and the reader task are
+all single-thread constructs. Concurrent `call()` from many coroutines on the
+owning thread is supported and is what the send lock is for; use `ProcessProxy`
+when calls must come from several threads.
+
+**A custom multiprocessing launcher can strand a child if `Process.start()`
+raises after creating it.** `start()` is not atomic: CPython's POSIX spawn
+creates the OS child, records its pid and sentinel, and only then writes the
+bootstrap payload. gisolate recovers and reaps that case for the standard POSIX
+`spawn` and `fork` launchers, which record the pid before anything fallible.
+`forkserver` is not covered: it reads the pid last, after the request that
+already created the child, so a failure before that leaves a child gisolate can
+neither name nor signal. A custom `mp_context` whose `Process`/`Popen` creates a child and
+then raises without exposing its handle may leave that child running, or a
+zombie, until the parent exits. gisolate does not call `waitpid(-1)`, because
+that would consume the exit status of children owned by the host application.
+
+**Build a `ProcessProxy` on the thread whose hub you want it on — in practice the
+main one.** The owner is the thread that constructed it, and its socket, reader
+and lifecycle calls belong to that thread's hub; but the marshal other threads
+use to reach it targets the MAIN hub. Construct one on a native thread and those
+two disagree, which for a ZMQ socket is undefined behaviour rather than a slow
+path. Calling and restarting FROM other threads is supported and is what the
+marshal is for.
+
+**A `ProcessProxy` that is dropped rather than shut down is never collected.**
+Its reader greenlet holds the proxy, and the hub holds the reader, so nothing
+finalizes: the child, the socket and its file all stay until the process exits.
+`shutdown()` — or the context manager — is the lifecycle; `__del__` is a
+best-effort backstop for the cases that do reach it, such as a start that failed
+after publishing. Breaking the cycle would mean a weak reference re-resolved on
+every iteration of the reader, paid by every correct user.
+
+**A subscriber handler that never returns outlives its `close()`.** The reader
+stops with its generation, but a handler already running is not killed — it holds
+the callback it was given, and a close/start cycle can leave one abandoned batch
+per generation. The same cooperative limit as the executor thread above: nothing
+can stop code that will not stop itself.
+
+**A subscriber handler that never returns also stops the stream.** Each batch of
+handlers is waited for before the next receive, on both runtimes, because the
+alternative was measured and worse: draining ahead of the handlers defeats SUB's
+receive queue and PUB's high-water mark — the two things that answer a handler
+slower than the stream — and turns a slow handler into unbounded live greenlets,
+each holding its payload. A handler that never returns therefore wedges its
+subscriber; a handler that is merely slow gets backpressure, which is the design.
+
+**An async `factory()` or `connect()` that never finishes poisons its worker.**
+The one client build is never cancelled and never retried while in flight: a
+caller's expiring deadline abandons only its own wait. Retrying instead was the
+original bug — two clients built for one worker, and a close racing a connect
+that cancellation cannot reach (the executor thread above) — and each retry of a
+hanging build stacks another unstoppable thread. Every call times out against
+the same build; restarting the worker is the recovery, as it is for a hung sync
+build.
+
+**Reaping a stranded child is not bounded.** In the one launch path with a pid
+but no sentinel, gisolate kills the child and waits for it, and that wait has no
+timeout — a child SIGKILLed while in uninterruptible kernel I/O holds up the
+start that found it. There is no partial answer here: leaving early makes it a
+zombie nothing owns.
+
+**`ipc://@name` leaks its socket file off Linux.** On Linux that is an abstract
+endpoint with no filesystem entry; elsewhere `@` is an ordinary path character,
+and rather than risk deleting a stranger's file we leak ours.
+
+**`serve()` trusts whoever can connect.** The wire is unauthenticated pickle and
+an empty frame stops the worker, so the socket's directory is the access control.
+A spawned `ProcessProxy` gets this for free — its addresses live in a per-uid
+directory created `0700`.
+
 ## License
 
 MIT
