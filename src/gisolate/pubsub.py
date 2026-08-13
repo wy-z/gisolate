@@ -19,7 +19,6 @@ import contextlib
 import enum
 import inspect
 import logging
-import os
 from typing import Any, Awaitable, Callable, Self
 
 from . import _internal
@@ -36,21 +35,7 @@ class Runtime(enum.StrEnum):
     ASYNC = "asyncio"
 
 
-def _safe_close(sock: Any, ctx: Any) -> None:
-    """Best-effort tear down of a ZMQ socket + context. Swallows errors."""
-    with contextlib.suppress(Exception):
-        if sock is not None:
-            sock.close(linger=0)
-    with contextlib.suppress(Exception):
-        if ctx is not None:
-            ctx.term()
-
-
 class _PubSubBase(abc.ABC):
-    """Shared runtime-dispatch plumbing for publisher/subscriber: lifecycle
-    flags, context managers, and the sync-or-awaitable ``close`` dispatcher.
-    """
-
     # _start_* implementations own setting ``self._started = True`` once
     # their resources are live. start() must NOT set it afterwards: with an
     # eager task factory a handler may run close() *inside* _start_async,
@@ -79,14 +64,14 @@ class _PubSubBase(abc.ABC):
         self._runtime = Runtime(runtime)
         self._serializer = serializer
         self._started = False
-        self._sock: Any = None
-        self._ctx: Any = None
+        self._transport: _internal.ZmqTransport | None = None
 
     def __del__(self):
         # Best-effort sync cleanup from finalizer. Avoid full close(): at GC
         # time the loop/hub may be torn down (locks can fail, readers leak).
         # Call close() explicitly for deterministic cleanup.
-        _safe_close(getattr(self, "_sock", None), getattr(self, "_ctx", None))
+        if (transport := getattr(self, "_transport", None)) is not None:
+            transport.close()
 
     def __enter__(self) -> Self:
         if self._runtime is not Runtime.GEVENT:
@@ -192,37 +177,37 @@ class ProcessPublisher(_PubSubBase):
         import gevent.lock
         import zmq.green
 
-        ctx = zmq.green.Context()
-        self._ctx, self._sock = ctx, self._bind_pub(ctx)
+        # Before the bind, like the running-loop check in the async start: the
+        # bind is the step that creates something to release, and anything
+        # failing after it — a MemoryError here is the realistic one — leaves a
+        # bound socket that only the traceback can reach, since _transport is
+        # still None for close() and __del__.
         self._send_lock = gevent.lock.Semaphore()
+        self._transport = self._bind_pub(zmq.green.Context)
         self._started = True
 
     def _start_async(self) -> None:
         import zmq.asyncio
 
         # Require a running loop *before* allocating ZMQ resources, so a
-        # caller misusing the API doesn't leave the publisher half-built.
+        # caller misusing the API doesn't leave the publisher half-built. The
+        # lock is here for the same reason — see the gevent start.
         asyncio.get_running_loop()
-
-        ctx = zmq.asyncio.Context()
-        self._ctx, self._sock = ctx, self._bind_pub(ctx)
         self._send_lock = asyncio.Lock()
+
+        self._transport = self._bind_pub(zmq.asyncio.Context)
         self._started = True
 
-    def _bind_pub(self, ctx: Any) -> Any:
-        """Create + configure + bind a PUB socket on ``ctx``. Closes on failure."""
+    def _bind_pub(self, context_factory: Any) -> _internal.ZmqTransport:
         import zmq
 
-        sock = None
-        try:
-            sock = ctx.socket(zmq.PUB)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.SNDHWM, self._sndhwm)
-            sock.bind(self._addr)
-        except Exception:
-            _safe_close(sock, ctx)
-            raise
-        return sock
+        return _internal.ZmqTransport.open(
+            context_factory,
+            zmq.PUB,
+            self._addr,
+            bind=True,
+            options=[(zmq.SNDHWM, self._sndhwm)],
+        )
 
     def publish(self, topic: str, payload: Any) -> Any:
         """Publish ``payload`` under ``topic``. Non-blocking.
@@ -244,13 +229,23 @@ class ProcessPublisher(_PubSubBase):
         import zmq
 
         data = self._serializer.dumps(payload)
-        with self._send_lock:
+        # Bound to THIS generation, like the bridge's call(): waiting on the
+        # lock is where a close+start lands, and re-reading ``self`` after it
+        # sent on the NEW generation's socket while holding the OLD lock —
+        # beside a publish legitimately holding the new one, interleaving
+        # their multipart frames. A publish accepted before the close is that
+        # generation's message; it drops with it.
+        transport, lock = self._transport, self._send_lock
+        if transport is None:
+            return
+        with lock:
             # Concurrent close() may have torn the socket down between our
-            # _started check above and acquiring the lock; re-check.
-            if not self._started:
+            # _started check above and acquiring the lock; re-check — against
+            # the generation we captured, not whatever replaced it.
+            if not self._started or transport is not self._transport:
                 return
             try:
-                self._sock.send_multipart(
+                transport.sock.send_multipart(
                     [topic.encode("utf-8"), data], flags=zmq.NOBLOCK
                 )
             except zmq.Again:
@@ -263,11 +258,15 @@ class ProcessPublisher(_PubSubBase):
         import zmq
 
         data = self._serializer.dumps(payload)
-        async with self._send_lock:
-            if not self._started:
+        # Generation-bound — see the gevent path.
+        transport, lock = self._transport, self._send_lock
+        if transport is None:
+            return
+        async with lock:
+            if not self._started or transport is not self._transport:
                 return
             try:
-                await self._sock.send_multipart(
+                await transport.sock.send_multipart(
                     [topic.encode("utf-8"), data], flags=zmq.NOBLOCK
                 )
             except zmq.Again:
@@ -282,21 +281,18 @@ class ProcessPublisher(_PubSubBase):
         # undefined. publish() re-checks _started inside the same lock.
         with self._send_lock:
             self._started = False
-            _safe_close(self._sock, self._ctx)
-        self._unlink_ipc()
+            transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.close()
 
     async def _close_async(self) -> None:
         if not self._started:
             return
         async with self._send_lock:
             self._started = False
-            _safe_close(self._sock, self._ctx)
-        self._unlink_ipc()
-
-    def _unlink_ipc(self) -> None:
-        if self._addr.startswith("ipc://"):
-            with contextlib.suppress(OSError):
-                os.unlink(self._addr[6:])
+            transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.close()
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +310,11 @@ class ProcessSubscriber(_PubSubBase):
     ``close`` is safe to call from inside a handler: the reader is not
     joined in that case (joining yourself would deadlock); sibling handlers
     in the current dispatch are allowed to finish — the reader is never
-    cancelled, so the dispatch is not torn down.
+    cancelled, so the dispatch is not torn down. That guarantee is why close
+    never kills a handler, so one that does not return outlives it, holding a
+    greenlet or a task until the process ends. Only the batch in flight can be
+    outstanding, though: the reader waits for each dispatch before receiving
+    the next.
 
     Args:
         address: IPC/TCP address (e.g., ``"ipc:///tmp/stream.sock"``).
@@ -359,45 +359,56 @@ class ProcessSubscriber(_PubSubBase):
         import zmq.asyncio
 
         loop = asyncio.get_running_loop()
-        ctx = zmq.asyncio.Context()
-        sock = self._connect_sub(ctx)
-        self._ctx = ctx
-        self._sock = sock
+        transport = self._connect_sub(zmq.asyncio.Context)
+        self._transport = transport
         # Set before spawning the reader: an eager task factory (3.12+,
         # asyncio.eager_task_factory) runs the task synchronously inside
         # create_task, so the reader's gate must already see started=True.
         self._started = True
-        # Bind the reader to *this* socket. A close()+start() restart from
-        # inside a handler swaps ``self._sock``; the stale reader must not
-        # resume against the new socket (would race the new reader's recv).
-        self._reader = loop.create_task(self._read_loop_async(sock))
+        try:
+            # Bind the reader to *this* transport. A close()+start() restart
+            # from inside a handler swaps ``self._transport``; the stale reader
+            # must not resume against the new one (would race its recv).
+            self._reader = loop.create_task(self._read_loop_async(transport))
+        except BaseException:
+            # An installed task factory can refuse. Nothing may stay claimed:
+            # start() would no-op on the retry, over a live transport with no
+            # reader behind it.
+            self._started = False
+            self._transport = None
+            transport.close()
+            raise
 
     def _start_gevent(self) -> None:
         import gevent
         import zmq.green
 
-        ctx = zmq.green.Context()
-        sock = self._connect_sub(ctx)
-        self._ctx = ctx
-        self._sock = sock
+        transport = self._connect_sub(zmq.green.Context)
+        self._transport = transport
         self._started = True  # before spawn, mirroring _start_async
-        self._reader = gevent.spawn(self._read_loop_gevent, sock)
+        try:
+            self._reader = gevent.spawn(self._read_loop_gevent, transport)
+        except BaseException:
+            # Same rollback as _start_async's, and for the same reason: a
+            # refused spawn would otherwise leave start() to no-op on the retry
+            # over a live transport with no reader behind it.
+            self._started = False
+            self._transport = None
+            transport.close()
+            raise
 
-    def _connect_sub(self, ctx: Any) -> Any:
-        """Create + configure + connect a SUB socket on ``ctx``. Closes on failure."""
+    def _connect_sub(self, context_factory: Any) -> _internal.ZmqTransport:
         import zmq
 
-        sock = None
-        try:
-            sock = ctx.socket(zmq.SUB)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(self._addr)
-            for prefix in self._handlers:
-                sock.setsockopt(zmq.SUBSCRIBE, prefix.encode("utf-8"))
-        except Exception:
-            _safe_close(sock, ctx)
-            raise
-        return sock
+        return _internal.ZmqTransport.open(
+            context_factory,
+            zmq.SUB,
+            self._addr,
+            bind=False,
+            options=[
+                (zmq.SUBSCRIBE, prefix.encode("utf-8")) for prefix in self._handlers
+            ],
+        )
 
     def subscribe(self, topic_prefix: str, handler: Handler) -> None:
         """Register ``handler`` for topics starting with ``topic_prefix``.
@@ -410,8 +421,10 @@ class ProcessSubscriber(_PubSubBase):
 
         new_prefix = topic_prefix not in self._handlers
         self._handlers.setdefault(topic_prefix, []).append(handler)
-        if new_prefix and self._started:
-            self._sock.setsockopt(zmq.SUBSCRIBE, topic_prefix.encode("utf-8"))
+        if new_prefix and self._started and self._transport is not None:
+            self._transport.sock.setsockopt(
+                zmq.SUBSCRIBE, topic_prefix.encode("utf-8")
+            )
 
     def unsubscribe(
         self, topic_prefix: str, handler: Handler | None = None
@@ -431,21 +444,13 @@ class ProcessSubscriber(_PubSubBase):
                 handlers.remove(handler)
         if not handlers:
             self._handlers.pop(topic_prefix, None)
-            if self._started:
+            if self._started and self._transport is not None:
                 import zmq
 
                 with contextlib.suppress(Exception):
-                    self._sock.setsockopt(
+                    self._transport.sock.setsockopt(
                         zmq.UNSUBSCRIBE, topic_prefix.encode("utf-8")
                     )
-
-    def _match(self, topic: str) -> list[Handler]:
-        return [
-            h
-            for prefix, handlers in self._handlers.items()
-            if topic.startswith(prefix)
-            for h in handlers
-        ]
 
     def _decode_and_match(
         self, parts: list[bytes]
@@ -459,38 +464,51 @@ class ProcessSubscriber(_PubSubBase):
         if len(parts) < 2:
             return None
         topic = parts[0].decode("utf-8", errors="replace")
-        handlers = self._match(topic)
+        handlers = [
+            h
+            for prefix, hs in self._handlers.items()
+            if topic.startswith(prefix)
+            for h in hs
+        ]
         if not handlers:
             return None
         try:
             payload = self._serializer.loads(parts[1])
-        except Exception:
+        except KeyboardInterrupt:
+            # The operator's, arriving while a legitimate payload is being
+            # reconstructed. Logging it as a bad payload absorbs Ctrl-C.
+            raise
+        # BaseException otherwise: reconstruction runs the publisher's code, and
+        # one payload raising SystemExit would take the reader down — silently,
+        # in gevent, leaving a subscriber that still calls itself started.
+        except BaseException:
             log.exception("subscriber failed to deserialize topic %s", topic)
             return None
         return topic, payload, handlers
 
     # ----- reader loops --------------------------------------------------
 
-    async def _read_loop_async(self, sock: Any) -> None:
+    async def _read_loop_async(self, transport: _internal.ZmqTransport) -> None:
         """Asyncio reader: dispatch messages to matched handlers.
 
-        ``sock`` is captured at task creation time so a close+restart cycle
-        leaves stale readers pointing at the already-closed socket — their
-        recv fails immediately and they exit without touching the new socket.
+        ``transport`` is captured at task creation time so a close+restart
+        cycle leaves stale readers pointing at the already-closed one — their
+        recv fails immediately and they exit without touching the new one.
         """
+        sock = transport.sock
         try:
             while True:
                 # Check before each recv: close() or a close+start restart
-                # may have swapped ``self._sock`` while we were suspended in
-                # the previous gather() (pyzmq does not necessarily wake a
+                # may have swapped ``self._transport`` while we were suspended
+                # in the previous gather() (pyzmq does not necessarily wake a
                 # pending recv future when the socket is closed, so we can't
                 # rely solely on recv raising).
-                if not self._started or sock is not self._sock:
+                if not self._started or transport is not self._transport:
                     return
                 try:
                     parts = await sock.recv_multipart()
                 except Exception:
-                    if not self._started or sock is not self._sock:
+                    if not self._started or transport is not self._transport:
                         return
                     raise
                 matched = self._decode_and_match(parts)
@@ -505,15 +523,23 @@ class ProcessSubscriber(_PubSubBase):
                     return_exceptions=True,
                 )
                 for r in results:
-                    if isinstance(r, (SystemExit, KeyboardInterrupt)):
+                    # The operator's interrupt is the one thing a handler may
+                    # not absorb on the host's behalf.
+                    if isinstance(r, KeyboardInterrupt):
                         raise r
         except asyncio.CancelledError:
             pass
+        except KeyboardInterrupt:
+            # Passed on, but not silently: a host that catches it and carries on
+            # would otherwise hold a subscriber that still calls itself started,
+            # over a dead reader and a live socket — and start() would no-op.
+            self._self_destruct(transport)
+            raise
         except Exception:
             log.exception("subscriber reader task crashed")
-            self._self_destruct(sock)
+            self._self_destruct(transport)
 
-    def _read_loop_gevent(self, sock: Any) -> None:
+    def _read_loop_gevent(self, transport: _internal.ZmqTransport) -> None:
         """Gevent reader: spawn a greenlet per handler invocation.
 
         Uses a 100ms poll so close() is observed promptly without depending
@@ -521,9 +547,10 @@ class ProcessSubscriber(_PubSubBase):
         """
         import gevent
 
+        sock = transport.sock
         try:
             while True:
-                if not self._started or sock is not self._sock:
+                if not self._started or transport is not self._transport:
                     return
                 try:
                     if not sock.poll(100):
@@ -532,38 +559,52 @@ class ProcessSubscriber(_PubSubBase):
                 except gevent.GreenletExit:
                     return
                 except Exception:
-                    # Silence only when caused by close()/stale-socket;
+                    # Silence only when caused by close()/stale-transport;
                     # otherwise fall through to ``_self_destruct`` so the
                     # subscriber doesn't look alive with a dead reader.
-                    if not self._started or sock is not self._sock:
+                    if not self._started or transport is not self._transport:
                         return
                     raise
                 matched = self._decode_and_match(parts)
                 if matched is None:
                     continue
                 topic, payload, handlers = matched
-                # Spawn-and-forget: matches asyncio.gather(...) semantics of
-                # isolating handlers from the reader and from each other.
-                # Errors are logged in _invoke_gevent.
-                for h in handlers:
-                    gevent.spawn(self._invoke_gevent, h, topic, payload)
+                # Spawned for concurrency, then waited for — the same shape as
+                # the asyncio reader's gather, and for a reason spawn-and-forget
+                # lost: a handler slower than the stream is what SUB's receive
+                # queue and PUB's high-water mark exist to answer, by dropping
+                # messages at the publisher. Draining ahead of the handlers
+                # defeats both, and turns a slow handler into unbounded live
+                # greenlets, each holding its payload. Errors are logged in
+                # _invoke_gevent, so joinall cannot raise.
+                gevent.joinall(
+                    [gevent.spawn(self._invoke_gevent, h, topic, payload)
+                     for h in handlers]
+                )
         except gevent.GreenletExit:
             pass
+        except KeyboardInterrupt:
+            self._self_destruct(transport)  # see the asyncio reader
+            raise
         except Exception:
             log.exception("subscriber reader greenlet crashed")
-            self._self_destruct(sock)
+            self._self_destruct(transport)
 
-    def _self_destruct(self, sock: Any) -> None:
+    def _self_destruct(self, transport: _internal.ZmqTransport) -> None:
         """Reader is dying for an unrelated reason — tear our resources down so
         the subscriber doesn't look alive while silently dropping messages.
-        The ``sock is self._sock`` guard skips stale readers left over from a
-        close+restart cycle (we'd otherwise close the *new* subscriber's
+        The ``transport is self._transport`` guard skips stale readers left over
+        from a close+restart cycle (we'd otherwise close the *new* subscriber's
         resources)."""
-        if sock is not self._sock or not self._started:
+        if transport is not self._transport or not self._started:
             return
+        # Snapshot first: it allocates its pair, and clearing the flag before
+        # a refused allocation left the transport attached behind
+        # _started=False — every later close returned without releasing it.
+        owned, _ = self._snapshot_owned()
         self._started = False
-        sock, ctx, _ = self._snapshot_owned()
-        _safe_close(sock, ctx)
+        if owned is not None:
+            owned.close()
 
     # ----- handler invocation -------------------------------------------
 
@@ -577,7 +618,21 @@ class ProcessSubscriber(_PubSubBase):
             # custom awaitables (not just coroutines) are supported.
             if inspect.isawaitable(result):
                 await result
-        except Exception:
+        except asyncio.CancelledError:
+            # Ours only. A cancellation aimed at this task is the loop shutting
+            # down; anything else is the handler's own leak, and isolating it is
+            # the whole point of running handlers separately.
+            if task is None or task.cancelling():
+                raise
+            log.exception("subscriber handler failed for topic %s", topic)
+        except KeyboardInterrupt:
+            raise  # the operator's — see _invoke_gevent
+        except BaseException:
+            # BaseException, not Exception: SystemExit raised inside a task is
+            # re-raised into the event loop by Task.__step and unwinds
+            # asyncio.run, so a handler dependency calling sys.exit(2) would end
+            # the whole subscriber host — the opposite of what "an exception in
+            # one handler is logged but does not kill the reader" promises.
             log.exception("subscriber handler failed for topic %s", topic)
         finally:
             if task is not None:
@@ -602,32 +657,48 @@ class ProcessSubscriber(_PubSubBase):
                 if inspect.iscoroutine(result):
                     with contextlib.suppress(Exception):
                         result.close()
-        except Exception:
+        except gevent.GreenletExit:
+            raise
+        except KeyboardInterrupt:
+            # The operator's, not the handler's. Measured: a real SIGINT is
+            # raised in whatever greenlet is running on the main OS thread, so
+            # it lands HERE rather than in the main greenlet, and catching it as
+            # a client failure is how Ctrl-C stops working.
+            raise
+        except BaseException:
+            # BaseException, for the reason the asyncio side gives: gevent
+            # forwards a greenlet's SystemExit or KeyboardInterrupt to the main
+            # greenlet, which ends the process — so a handler dependency's
+            # sys.exit(2) took the subscriber host with it.
             log.exception("subscriber handler failed for topic %s", topic)
         finally:
             self._handler_workers.discard(g)
 
     # ----- shutdown ------------------------------------------------------
 
-    def _snapshot_owned(self) -> tuple[Any, Any, Any]:
-        """Move owned sock/ctx/reader off ``self`` so a concurrent start()
-        can't have its fresh resources closed by us."""
-        sock, ctx, reader = self._sock, self._ctx, self._reader
-        self._sock = None
-        self._ctx = None
+    def _snapshot_owned(self) -> tuple[_internal.ZmqTransport | None, Any]:
+        """Move the owned transport and reader off ``self`` so a concurrent
+        start() can't have its fresh resources closed by us."""
+        # The pair is built BEFORE the stores: it is the one allocation here,
+        # and building it after detaching meant its MemoryError stranded a
+        # transport neither close() nor __del__ could reach any more.
+        snapshot = (self._transport, self._reader)
+        self._transport = None
         self._reader = None
-        return sock, ctx, reader
+        return snapshot
 
     async def _close_async(self) -> None:
         if not self._started:
             return
+        # Snapshot before the flag — see _self_destruct.
+        transport, reader = self._snapshot_owned()
         self._started = False
-        sock, ctx, reader = self._snapshot_owned()
-        # Close socket first. Any in-flight recv fails; the reader sees
+        # Close the transport first. Any in-flight recv fails; the reader sees
         # _started=False and exits cleanly. Avoid task.cancel() — it would
         # propagate through asyncio.gather and cancel sibling handlers
         # mid-execution when close() is called from inside a handler.
-        _safe_close(sock, ctx)
+        if transport is not None:
+            transport.close()
         current = asyncio.current_task()
         if (
             reader is not None
@@ -646,9 +717,11 @@ class ProcessSubscriber(_PubSubBase):
 
         if not self._started:
             return
+        # Snapshot before the flag — see _self_destruct.
+        transport, reader = self._snapshot_owned()
         self._started = False
-        sock, ctx, reader = self._snapshot_owned()
-        _safe_close(sock, ctx)
+        if transport is not None:
+            transport.close()
         current = gevent.getcurrent()
         if (
             reader is not None

@@ -61,3 +61,30 @@ class TestThreadLocalProxy:
         assert call_count == 1
         proxy.value  # reuses existing
         assert call_count == 1
+
+
+class TestConcurrentFirstAccess:
+    def test_two_greenlets_on_one_thread_see_one_instance(self):
+        """The factory opens things, which under gevent is a switch point: both
+        greenlets passed the hasattr check, both built, and the second
+        overwrote the first — so calls on one thread ran against two different
+        clients."""
+        import gevent
+
+        built = []
+
+        def factory():
+            gevent.sleep(0.05)  # a connection being opened
+            obj = object()
+            built.append(obj)
+            return obj
+
+        proxy = ThreadLocalProxy(factory)
+        seen = gevent.joinall(
+            [gevent.spawn(proxy._get_instance) for _ in range(2)], timeout=5
+        )
+        results = [g.value for g in seen]
+        assert results[0] is results[1], "one thread, two instances"
+        # And only one was ever built: publishing one of two is not enough,
+        # since nothing here closes the loser.
+        assert len(built) == 1, f"the factory ran {len(built)} times on one thread"

@@ -29,7 +29,22 @@ class ThreadLocalProxy:
     def _get_instance(self):
         local = self._local
         if not hasattr(local, "instance"):
-            local.instance = self._factory()
+            # Serialised, not merely re-checked: the factory opens things, which
+            # under gevent is a switch point, so two greenlets on this thread
+            # would otherwise BOTH build. Publishing one of them is not enough —
+            # this class has no close protocol, so the loser's descriptors would
+            # stay open for the life of the process. A gevent lock, because a
+            # native one is reentrant per thread and these are greenlets on one.
+            # The lock itself is created without yielding, so the greenlet that
+            # gets here first is the only one that can create it.
+            import gevent.lock
+
+            lock = getattr(local, "lock", None)
+            if lock is None:
+                lock = local.lock = gevent.lock.RLock()
+            with lock:
+                if not hasattr(local, "instance"):
+                    local.instance = self._factory()
         return local.instance
 
     def __getattr__(self, name):

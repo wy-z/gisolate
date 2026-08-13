@@ -66,7 +66,7 @@ class TestAttach:
         assert second.pid() == host_pid
         # ...and the departing client really did let go, rather than skipping
         # teardown because it had no process to stop.
-        assert first._sock is None and first._reader is None
+        assert first._transport is None and first._reader is None
         second.shutdown()
 
     def test_a_lost_local_transport_is_rebuilt_on_the_next_call(self, host):
@@ -76,9 +76,9 @@ class TestAttach:
             # What a local ZMQ failure leaves behind: the reader's `finally`
             # tears the transport down, and nothing owns a process to restart.
             proxy._stop()
-            assert proxy._sock is None
+            assert proxy._transport is None
             assert proxy.pid() == host_pid
-            assert proxy._sock is not None
+            assert proxy._transport is not None
 
     def test_a_call_that_expired_before_the_host_existed_never_runs(
         self, spawn_ctx, tmp_path
@@ -129,8 +129,8 @@ class TestAttach:
         address, host_pid = host
         with ProcessProxy.attach(address, timeout=15) as proxy:
             assert proxy.add(1, 1) == 2
-            before = proxy._sock
+            before = proxy._transport
             proxy.restart_process()  # for an attached proxy: reconnect, no spawn
-            assert proxy._sock is not before
+            assert proxy._transport is not before
             assert os.path.exists(address.removeprefix("ipc://"))
             assert proxy.pid() == host_pid
