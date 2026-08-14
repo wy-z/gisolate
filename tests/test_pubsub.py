@@ -1125,3 +1125,27 @@ class TestPublishGenerationBound:
             pub._transport = old_transport
             pub._send_lock = lock_a
             pub.close()
+
+    def test_a_stale_closer_leaves_the_restarted_generation_alone(self):
+        """Two closers race a restart: the winner closes generation A and
+        starts B without yielding — a PUB transport's close has no green op
+        to switch on — while the loser, parked on A's lock behind a publisher
+        mid-send, is scheduled but not yet run. The loser then wakes holding
+        a lock nothing current uses, and used to re-read ``self`` and tear
+        down the generation the restart had just published."""
+        pub = ProcessPublisher(_make_addr()).start()
+        lock_a = pub._send_lock
+        lock_a.acquire()  # stand in for a publisher mid-send
+        stale = gevent.spawn(pub.close)
+        gevent.sleep(0.05)  # the loser passes its check and parks on A's lock
+        lock_a.release()  # the sender finishes; the loser is scheduled, not run
+        pub.close()  # the winner barges past the parked loser...
+        pub.start()  # ...and restarts before the loser ever runs
+        fresh = pub._transport
+        stale.join(timeout=2)
+        try:
+            assert pub._started and pub._transport is fresh, (
+                "the stale closer tore down the restarted generation"
+            )
+        finally:
+            pub.close()

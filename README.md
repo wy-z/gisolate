@@ -339,15 +339,17 @@ for. `max_concurrency` bounds awaiting handlers; a client whose sync methods mus
 not overlap needs its own lock. The gevent worker has no such gap — `kill()`
 lands inside client code at its next switch.
 
-**An asyncio handler's own cleanup can run after the client is closed.** The
-shutdown cancels outstanding handlers and disposes the client without waiting for
-them, so a handler's `finally` may touch an object that is already closed. Giving
-them a step first is worse, and was measured: a handler waiting on the client
-build resumes holding it and reaches `off_loop`, which submits the call to the
-executor *before* the await where the cancellation lands — running the very call
-the shutdown exists to prevent, and taking the thread the dispose then waits on.
-The gevent worker has no such trade: a kill lands at the handler's current switch
-point and starts nothing.
+**A handler's own cleanup can run after the client is closed.** The shutdown
+cancels outstanding asyncio handlers *before* waiting out a pending client build:
+a handler parked on that build has its wake registered ahead of the teardown's,
+so left uncancelled it resumes first when the build completes and `off_loop`
+submits the very call the shutdown exists to prevent (measured, in an unpatched
+child). A cancelled handler's `finally` may still touch an object that is already
+closed — giving it a step first is the worse trade. The gevent worker's mirror is
+a handler whose lock wake outruns the kill batch's `GreenletExit` (both are hub
+callbacks, FIFO): a `stopping` fence set between the drain giving up and the kill
+is re-checked at admission's last yield-free instant, so that wake refuses
+instead of starting a call after the grace.
 
 **`serve()` has no hard shutdown bound (asyncio worker).** After the six-second
 drain, `asyncio.run` cancels what is left and waits for it with no timeout of its
