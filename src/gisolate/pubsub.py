@@ -275,24 +275,33 @@ class ProcessPublisher(_PubSubBase):
                 log.warning("publisher send failed for topic %s: %s", topic, exc)
 
     def _close_gevent(self) -> None:
-        if not self._started:
+        # Bound to THIS generation, like the publishes: parking on the lock is
+        # where a close+restart lands, and a stale closer that woke holding
+        # the OLD generation's lock used to re-read ``self`` and tear down the
+        # generation the restart had just published.
+        transport, lock = self._transport, self._send_lock
+        if not self._started or transport is None:
             return
         # Serialize with publish(): closing while a greenlet is mid-send is
-        # undefined. publish() re-checks _started inside the same lock.
-        with self._send_lock:
+        # undefined. publish() re-checks the generation inside the same lock.
+        with lock:
+            if transport is not self._transport:
+                return  # this generation is already closed; the fresh one is not ours
             self._started = False
-            transport, self._transport = self._transport, None
-        if transport is not None:
-            transport.close()
+            self._transport = None
+        transport.close()
 
     async def _close_async(self) -> None:
-        if not self._started:
+        # Generation-bound — see the gevent path.
+        transport, lock = self._transport, self._send_lock
+        if not self._started or transport is None:
             return
-        async with self._send_lock:
+        async with lock:
+            if transport is not self._transport:
+                return
             self._started = False
-            transport, self._transport = self._transport, None
-        if transport is not None:
-            transport.close()
+            self._transport = None
+        transport.close()
 
 
 # ---------------------------------------------------------------------------

@@ -316,14 +316,18 @@ class TestServerAddressOwnership:
         gevent.sleep(0.5)
         assert len(_ticks) == settled  # ...and stopped when the bridge closed
 
-    def test_a_client_start_without_a_running_loop_refuses(self):
-        """On 3.12 and 3.13 ensure_future does not refuse a caller with no
-        running loop — it puts the reader on a dormant policy loop that never
-        runs it, so a live server's replies are never consumed and every call
-        times out. Nothing may be allocated before that is ruled out."""
+    def test_a_client_start_without_a_running_loop_defers_the_reader(self):
+        """0.2.26 allowed start() outside any running loop, and the hard
+        refusal that first fixed the dormant-policy-loop bug broke that
+        caller. Deferred instead: no reader is built here — call(), a
+        coroutine necessarily inside a running loop, builds it there — and
+        what start() did allocate must still be released by a close() that
+        never saw a loop."""
         bridge = ProcessBridge(_make_addr(), mode=ProcessBridge.Mode.CLIENT)
-        with pytest.raises(RuntimeError):
-            bridge.start()  # no running loop here
+        bridge.start()  # no running loop here
+        assert bridge._started
+        assert bridge._reader_task is None  # deferred to the first call()
+        bridge.close()
         assert not bridge._started
         assert bridge._transport is None
 
@@ -920,3 +924,29 @@ class TestServeLoopFailure:
         finally:
             server.close()
         assert _unwound, "close() returned before the handler's finally ran"
+
+
+class TestStartBeforeTheLoop:
+    def test_start_outside_a_running_loop_defers_the_reader(self):
+        """The 0.2.26 caller: set a policy loop, start() the client outside any
+        running loop, then drive that same loop with run_until_complete. The
+        get_running_loop() hard-raise that fixed the dormant-policy-loop bug
+        broke this caller too. Deferring the reader keeps both: call() is a
+        coroutine, so it always runs inside SOME running loop, and that loop —
+        the one actually consuming replies — is where the reader is built."""
+        addr = _make_addr()
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER).start()
+        client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            client.start()  # no loop running here; 0.2.27 raised RuntimeError
+            result = loop.run_until_complete(
+                client.call(lambda x, y: x + y, 2, 3, timeout=10)
+            )
+            assert result == 5
+        finally:
+            client.close()
+            loop.close()
+            asyncio.set_event_loop(None)
+            server.close()

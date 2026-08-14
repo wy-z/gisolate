@@ -516,65 +516,79 @@ class TestClientExitOnClose:
 
 class TestHandlersStopBeforeDispose:
     def test_no_call_runs_after_the_client_is_closed(self, tmp_path):
-        """The teardown's wait for the build can complete it, and a handler
-        waking on that client would call into an object _dispose is about to
-        close — under serve() taking resources that outlive the restart."""
-        import functools
+        """The teardown's wait for the build can complete it — and the
+        shield's wake was registered before that wait's, so a handler parked
+        on the build resumes AHEAD of teardown and submits the very call
+        shutdown exists to prevent, into an object _dispose is about to
+        close. Handlers are cancelled BEFORE the build wait instead.
+
+        Run in a child with no monkey patching — the worker's real shape. In
+        a patched host the executor's threads are greenlets nothing drives,
+        so the schedule never happens there and the old in-process version of
+        this test passed vacuously; "closed" is asserted PRESENT so an empty
+        marker can never pass again."""
+        import subprocess
+        import sys
         import tempfile
+        import textwrap
         import uuid
 
-        import dill
-        import gevent
-        import gevent.monkey
-        import zmq.green
-
-        from gisolate._workers import WorkerConfig, asyncio_worker
-
-        from .helpers import slow_build_marker
-
-        Thread = gevent.monkey.get_original("threading", "Thread")
         marker = tmp_path / "events.txt"
         addr = f"ipc://{tempfile.gettempdir()}/gi-drain-{uuid.uuid4().hex[:8]}.sock"
-        worker = Thread(
-            target=asyncio_worker,
-            args=(
-                WorkerConfig(
-                    ipc_addr=addr,
-                    factory_bytes=dill.dumps(
-                        functools.partial(slow_build_marker, str(marker), 7.0)
-                    ),
+        script = textwrap.dedent(
+            f"""
+            import functools
+            import threading
+            import time
+
+            import dill
+            import zmq
+
+            from gisolate._internal import SmartPickle
+            from gisolate._workers import SHUTDOWN, WorkerConfig, asyncio_worker
+            from tests.helpers import slow_build_marker
+
+            addr = {addr!r}
+            cfg = WorkerConfig(
+                ipc_addr=addr,
+                factory_bytes=dill.dumps(
+                    functools.partial(slow_build_marker, {str(marker)!r}, 7.0)
                 ),
-            ),
-            daemon=True,
-        )
-        worker.start()
-        ctx = zmq.green.Context()
-        client = ctx.socket(zmq.DEALER)
-        try:
+            )
+            worker = threading.Thread(target=asyncio_worker, args=(cfg,), daemon=True)
+            worker.start()
+            ctx = zmq.Context()
+            client = ctx.socket(zmq.DEALER)
             for _ in range(200):
-                if os.path.exists(addr.removeprefix("ipc://")):
+                if __import__("os").path.exists(addr[6:]):
                     break
-                gevent.sleep(0.05)
+                time.sleep(0.05)
             client.connect(addr)
             # A deadline long enough that the handler is still waiting on the
             # build when the shutdown drain gives up on it.
-            req = SmartPickle.dumps(("ping", (), {}, time.monotonic() + 120))
+            req = SmartPickle.dumps(("ping", (), {{}}, time.monotonic() + 120))
             client.send_multipart([(1).to_bytes(8), req])
-            gevent.sleep(0.5)
+            time.sleep(0.5)
             client.send_multipart([b"0", SHUTDOWN])
-
-            deadline = time.monotonic() + 40
-            while worker.is_alive() and time.monotonic() < deadline:
-                gevent.sleep(0.1)
-            assert not worker.is_alive(), "the worker never returned"
-
-            events = marker.read_text().split() if marker.exists() else []
-            assert "called" not in events, f"a call ran against a closed client: {events}"
-        finally:
+            worker.join(timeout=30)
+            print("WORKER DEAD" if not worker.is_alive() else "WORKER ALIVE", flush=True)
             client.close(linger=0)
             ctx.term()
-            with contextlib.suppress(OSError):
-                os.unlink(addr.removeprefix("ipc://"))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+            timeout=90,
+        )
+        with contextlib.suppress(OSError):
+            os.unlink(addr.removeprefix("ipc://"))
+        assert "WORKER DEAD" in proc.stdout, (proc.returncode, proc.stderr[-800:])
+        events = marker.read_text().split() if marker.exists() else []
+        assert "closed" in events, f"the dispose never saw the build's client: {events}"
+        assert "called" not in events, f"a call ran against a closing client: {events}"
 
 
 class TestSlotAccounting:

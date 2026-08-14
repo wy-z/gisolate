@@ -120,6 +120,13 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     factory = dill.loads(cfg.factory_bytes)
     client = None
     client_lock = gevent.lock.RLock()
+    # The teardown's admission fence. kill() is not one: a handler parked on
+    # client_lock whose wake was queued by the release BEFORE the kill batch
+    # ran resumes ahead of its own GreenletExit, passes the deadline check,
+    # and starts its call after the grace expired (measured: the wake and the
+    # throw are both hub callbacks, FIFO). Set between the join giving up and
+    # the kill, read at _invoke's yield-free admission points.
+    stopping = False
     send_lock = gevent.lock.Semaphore()
     # Unbounded group + explicit slot semaphore: admission happens inside
     # handle() with a deadline, so saturation can never block _drain.
@@ -141,18 +148,31 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         nonlocal client
         try:
             with client_lock:
+                if stopping:
+                    # The fence: our wake was queued ahead of the kill's
+                    # GreenletExit, but the grace is over. This is that kill,
+                    # taken one wake early — before a build, not after.
+                    raise gevent.GreenletExit("worker stopping")
                 if client is None:
                     # An expired request must not trigger one-time client init.
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"{method} timed out")
                     client = factory()
+            # The lookup comes BEFORE the fence: it is client code — a lazy
+            # proxy's __getattribute__ can yield — and a yield between the
+            # fence and the call would reopen the window the fence closes.
+            fn = getattr(client, method)
             # Admission re-checked at the last yield-free instant before the
-            # client call: hub-callback backlog, client_lock contention, or a
-            # slow factory() can delay this greenlet past the deadline even
-            # when the spawning handler saw budget remaining.
+            # client call: hub-callback backlog, client_lock contention, a
+            # slow factory() or attribute lookup can delay this greenlet past
+            # the deadline even when the spawning handler saw budget
+            # remaining — or past the teardown's fence, which no deadline
+            # check notices.
+            if stopping:
+                raise gevent.GreenletExit("worker stopping")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{method} timed out")
-            return True, getattr(client, method)(*args, **kwargs)
+            return True, fn(*args, **kwargs)
         except gevent.GreenletExit:
             raise
         except KeyboardInterrupt:
@@ -292,6 +312,8 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         try:
             handlers.join(timeout=6)
         finally:
+            # Before the kill, so a wake the kill batch cannot outrun reads it.
+            stopping = True
             # Then stop whatever is left. A spawned child exits right after this
             # and takes its stragglers with it, but serve() runs this loop in a
             # process that survives it: a handler still running there holds the
@@ -608,15 +630,18 @@ def asyncio_worker(cfg: WorkerConfig):
                 # off_loop already names for work it cannot stop.
                 pending = build
                 if pending is not None:
-                    if not pending.done():
-                        # wait(), not await: it neither cancels nor raises.
-                        await asyncio.wait({pending}, timeout=6)
-                    # Between the wait finishing the build and the dispose
-                    # below, a handler that was waiting on it wakes: its step is
-                    # only SCHEDULED by the build's callbacks, so cancelling
-                    # here — synchronously, before the next await — is what
-                    # stops it calling into an object about to be closed. Under
-                    # serve() whatever it took would outlive the restart.
+                    # Handlers are cancelled BEFORE the build wait, not after:
+                    # a handler parked on the shield had its wake registered
+                    # when it first awaited — before the wait below registers
+                    # its own — so when the build completes, that handler
+                    # resumes AHEAD of us, and off_loop SUBMITS its call to
+                    # the executor before the await where a later cancel
+                    # could land. Measured: it runs the very call the
+                    # shutdown exists to prevent, into an object the dispose
+                    # below is about to close. Cancelled here, the pending
+                    # wake delivers CancelledError instead of the client, and
+                    # the build itself — never in this set once discarded —
+                    # runs on to be disposed.
                     tasks.discard(pending)
                     while tasks:
                         # Destructive pop, no list copy: the copy was an
@@ -624,16 +649,11 @@ def asyncio_worker(cfg: WorkerConfig):
                         # and the dispose below. Nothing runs between pops —
                         # done-callbacks only fire at the next await.
                         tasks.pop().cancel()
-                    # And NOT waited for. cancel() only schedules the
-                    # CancelledError, so a handler's own finally can run after
-                    # the dispose below — but giving it a step first is worse,
-                    # measured: a handler waiting on the build resumes with the
-                    # client and reaches off_loop, which SUBMITS the call to the
-                    # executor before the await where the cancellation lands. It
-                    # runs the very call the shutdown exists to prevent, and it
-                    # takes the executor thread the dispose then waits for. The
-                    # gevent worker has no such trade — a kill lands at the
-                    # handler's current switch point and starts nothing.
+                    if not pending.done():
+                        # wait(), not await: it neither cancels nor raises —
+                        # and while it parks, the cancelled handlers get the
+                        # loop to unwind through their own finallys.
+                        await asyncio.wait({pending}, timeout=6)
                     if (
                         pending.done()
                         and not pending.cancelled()

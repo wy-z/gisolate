@@ -71,6 +71,38 @@ except ImportError:  # pragma: no cover - Windows
     _StdlibForkPopen = _StdlibSpawnPopen = object
 
 
+# Children whose failed-launch reap was interrupted: pid -> when to give up.
+# Registered before the blocking reap even starts, so an interrupt landing
+# anywhere inside it leaves the obligation recorded for the next launch's
+# sweep. The deadline bounds how long a raw integer is trusted: a pid whose
+# zombie somebody else collected (libev's default-loop SIGCHLD handler reaps
+# too) can be RECYCLED, and a sweep still waitpid-ing that number would
+# consume an unrelated child's exit. Wrapping the whole pid space through
+# this process's children inside a minute is not a real schedule; holding
+# the number for hours would make it one. Dict ops are GIL-atomic, and the
+# sweep copies before iterating.
+_orphans: dict[int, float] = {}
+
+
+def _reap_orphans() -> None:
+    """Collect exits stranded by an interrupted failed-launch reap."""
+    for pid, give_up in list(_orphans.items()):
+        try:
+            # Deadline FIRST, and an expired pid is given back UNPROBED: the
+            # probe is itself a waitpid, which is exactly the alias the
+            # deadline exists to prevent.
+            if time.monotonic() >= give_up:
+                _orphans.pop(pid, None)
+            elif os.waitpid(pid, os.WNOHANG)[0] != 0:
+                _orphans.pop(pid, None)
+        except KeyboardInterrupt:
+            raise
+        except ChildProcessError:
+            _orphans.pop(pid, None)  # collected by someone else; done
+        except Exception:
+            pass  # only ECHILD proves the obligation gone; retry next launch
+
+
 def _publish_failed_launch(popen: Any, process_obj: Any) -> None:
     """Hand back a child whose launch raised after creating it.
 
@@ -117,10 +149,40 @@ def _publish_failed_launch(popen: Any, process_obj: Any) -> None:
         # never finish. A child whose kill failed leaks instead — the bounded
         # loss, and the README's unbounded-reap limit covers the rest.
         if killed:
+            # Registered BEFORE the wait, so an interrupt landing anywhere in
+            # the reap — including between the bytecodes of the reap's own
+            # recovery — leaves the obligation recorded: skipping it stranded
+            # a zombie nothing else can collect, since _popen was never
+            # published. Best-effort, because tracking must not fail the
+            # recovery it serves. What stays unregistered is an interrupt
+            # landing before this very statement — the same unavoidable class
+            # as one landing before the kill above, where the child leaks
+            # alive instead.
             try:
-                os.waitpid(pid, 0)
+                _orphans[pid] = time.monotonic() + 60.0
             except Exception:
                 pass
+            try:
+                os.waitpid(pid, 0)
+                _orphans.pop(pid, None)
+            except KeyboardInterrupt:
+                # The operator's, and it goes through — after one bounded
+                # WNOHANG try, no sleep: the exit is normally already there,
+                # but (0, 0) means "not waitable NOW", so a miss keeps the
+                # registration for the next launch's sweep instead.
+                try:
+                    deadline = time.monotonic() + 0.05
+                    while time.monotonic() < deadline:
+                        if os.waitpid(pid, os.WNOHANG)[0] != 0:
+                            _orphans.pop(pid, None)
+                            break
+                except Exception:
+                    pass  # still registered; the sweep owns it now
+                raise
+            except ChildProcessError:
+                _orphans.pop(pid, None)  # collected by someone else; done
+            except Exception:
+                pass  # still registered; the sweep owns it now
         return
     try:
         process_obj._popen = popen
@@ -180,6 +242,10 @@ def _launch_recoverably(process: Any) -> None:
     descriptors, or doing setup of its own — and replacing that would start a
     child without it.
     """
+    # Every launch first collects what an interrupted recovery left
+    # registered — here rather than on a teardown path, because the sweep
+    # allocates (the copy) and launch is allowed to.
+    _reap_orphans()
     ours = _RECOVERABLE_LAUNCHERS.get(getattr(type(process), "_Popen", None))
     if ours is None:
         return

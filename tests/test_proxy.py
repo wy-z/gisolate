@@ -1591,3 +1591,189 @@ class TestFailedLaunchReap:
         )
         monkeypatch.undo()
         assert not reaps, "the reap would have blocked on a child the kill never reached"
+
+    def test_an_interrupted_reap_collects_a_lagging_exit_and_reraises(
+        self, monkeypatch
+    ):
+        """Ctrl-C landing in the blocked waitpid is the operator's and must
+        propagate — but the kill already took, so skipping the reap outright
+        strands a zombie nothing else can collect: _popen was never published,
+        so no cleanup path and no exit handler knows the pid. And WNOHANG
+        legitimately answers (0, 0) while the killed child is still
+        descheduled, so a single probe is a coin toss — the bounded spin
+        keeps probing until the exit lands, then the interrupt goes through."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        calls = []
+
+        def interrupted_waitpid(pid, flags):
+            if flags == 0:
+                raise KeyboardInterrupt
+            calls.append((pid, flags))
+            if len(calls) < 3:
+                return (0, 0)  # killed, not yet exited
+            return (pid, 0)
+
+        monkeypatch.setattr(proxy_mod.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(proxy_mod.os, "waitpid", interrupted_waitpid)
+        with pytest.raises(KeyboardInterrupt):
+            proxy_mod._publish_failed_launch(
+                types.SimpleNamespace(pid=999_999_999), object()
+            )
+        monkeypatch.undo()
+        assert calls and calls[-1] == (999_999_999, proxy_mod.os.WNOHANG)
+        assert len(calls) == 3, "the reap gave up while the exit was still landing"
+        assert 999_999_999 not in proxy_mod._orphans, (
+            "a collected exit must not stay registered"
+        )
+
+    def test_a_reap_that_never_lands_still_honors_the_interrupt(self, monkeypatch):
+        """A child whose exit does not land inside the bounded spin must not
+        hold the operator's interrupt hostage — and must not be forgotten
+        either: it stays registered for the next launch's sweep, because
+        (0, 0) at the deadline means "not waitable NOW", not "never"."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        def interrupted_waitpid(pid, flags):
+            if flags == 0:
+                raise KeyboardInterrupt
+            return (0, 0)  # not exited yet
+
+        monkeypatch.setattr(proxy_mod.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(proxy_mod.os, "waitpid", interrupted_waitpid)
+        started = time.monotonic()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                proxy_mod._publish_failed_launch(
+                    types.SimpleNamespace(pid=999_999_999), object()
+                )
+            monkeypatch.undo()
+            assert time.monotonic() - started < 1.0, "the retry must be bounded"
+            assert 999_999_999 in proxy_mod._orphans, (
+                "the uncollected exit lost its only reaper"
+            )
+        finally:
+            proxy_mod._orphans.pop(999_999_999, None)
+
+    def test_a_second_interrupt_mid_spin_does_not_lose_the_reap(self, monkeypatch):
+        """Signals land between bytecodes: a second Ctrl-C during the spin
+        escapes the except Exception around it. The pid is registered BEFORE
+        the spin, so the obligation survives the escape."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        def interrupted_waitpid(pid, flags):
+            raise KeyboardInterrupt  # the first in the block, the second mid-spin
+
+        monkeypatch.setattr(proxy_mod.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(proxy_mod.os, "waitpid", interrupted_waitpid)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                proxy_mod._publish_failed_launch(
+                    types.SimpleNamespace(pid=999_999_999), object()
+                )
+            monkeypatch.undo()
+            assert 999_999_999 in proxy_mod._orphans
+        finally:
+            proxy_mod._orphans.pop(999_999_999, None)
+
+    def test_the_next_launch_collects_a_registered_orphan(self, monkeypatch):
+        """The registered pid's exit is collected by the sweep every launch
+        runs, and a pid someone else already reaped is dropped rather than
+        retried for ever."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        reaped = []
+        monkeypatch.setattr(
+            proxy_mod.os, "waitpid", lambda pid, flags: (reaped.append(pid), (pid, 0))[1]
+        )
+        proxy_mod._orphans[999_999_999] = time.monotonic() + 60.0
+        try:
+            proxy_mod._launch_recoverably(types.SimpleNamespace())
+            monkeypatch.undo()
+            assert reaped == [999_999_999]
+            assert 999_999_999 not in proxy_mod._orphans
+        finally:
+            proxy_mod._orphans.pop(999_999_999, None)
+
+    def test_someone_elses_reap_releases_the_obligation(self, monkeypatch):
+        """ECHILD is the one proof the obligation is gone — libev's
+        default-loop SIGCHLD handler reaps children too — and it must drop
+        the registration on the spot, not leave a stale integer for the pid
+        space to recycle into somebody else's child."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        def raising_waitpid(pid, flags):
+            raise ChildProcessError
+
+        monkeypatch.setattr(proxy_mod.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(proxy_mod.os, "waitpid", raising_waitpid)
+        try:
+            proxy_mod._publish_failed_launch(
+                types.SimpleNamespace(pid=999_999_999), object()
+            )
+            monkeypatch.undo()
+            assert 999_999_999 not in proxy_mod._orphans
+        finally:
+            proxy_mod._orphans.pop(999_999_999, None)
+
+    def test_an_unexplained_wait_failure_keeps_the_obligation(self, monkeypatch):
+        """Anything short of ECHILD proves nothing about the child: the
+        registration stays for the sweep instead of being discarded on the
+        first excuse."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        def raising_waitpid(pid, flags):
+            raise OSError("transient")
+
+        monkeypatch.setattr(proxy_mod.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(proxy_mod.os, "waitpid", raising_waitpid)
+        try:
+            proxy_mod._publish_failed_launch(
+                types.SimpleNamespace(pid=999_999_999), object()
+            )
+            monkeypatch.undo()
+            assert 999_999_999 in proxy_mod._orphans
+        finally:
+            proxy_mod._orphans.pop(999_999_999, None)
+
+    def test_the_sweep_gives_a_stale_number_back(self, monkeypatch):
+        """A pid past its deadline is dropped WITHOUT being probed: the
+        number can be RECYCLED once somebody else collected the zombie, and
+        even one more waitpid on it is exactly the alias the deadline exists
+        to prevent — it would consume an unrelated child's exit. Before the
+        deadline the obligation is kept."""
+        import types
+
+        from gisolate import proxy as proxy_mod
+
+        probed = []
+        monkeypatch.setattr(
+            proxy_mod.os,
+            "waitpid",
+            lambda pid, _flags: (probed.append(pid), (0, 0))[1],
+        )
+        proxy_mod._orphans[999_999_998] = time.monotonic() + 60.0
+        proxy_mod._orphans[999_999_999] = time.monotonic() - 1.0
+        try:
+            proxy_mod._launch_recoverably(types.SimpleNamespace())
+            monkeypatch.undo()
+            assert 999_999_998 in proxy_mod._orphans, "dropped before its deadline"
+            assert 999_999_999 not in proxy_mod._orphans, "kept past its deadline"
+            assert probed == [999_999_998], (
+                "an expired pid must be given back unprobed — the probe IS the alias"
+            )
+        finally:
+            proxy_mod._orphans.pop(999_999_998, None)
+            proxy_mod._orphans.pop(999_999_999, None)

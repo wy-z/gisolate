@@ -91,7 +91,7 @@ class ProcessBridge:
         loop = asyncio.get_running_loop()
         if not self._started or self._transport is None:
             self._start_client()
-        elif self._loop is not loop:
+        elif self._loop is not None and self._loop is not loop:
             # A second asyncio.run(), and nothing of the old generation carries
             # over. pyzmq migrates the FD watcher but keeps ONE receive queue,
             # so the previous reader's outstanding recv stays ahead of any new
@@ -104,6 +104,11 @@ class ProcessBridge:
             self.close()
             self._start_client()
         elif self._reader_task is None or self._reader_task.done():
+            # Adopts a start() made before any loop ran (_loop still None):
+            # no reader has ever recv'd, so the socket carries no queue bound
+            # elsewhere, and THIS loop — the one consuming replies — is the
+            # generation's from here on.
+            self._loop = loop
             self._reader_task = loop.create_task(
                 self._read_responses(self._transport)
             )
@@ -240,11 +245,17 @@ class ProcessBridge:
         """Initialize client (asyncio DEALER socket + reader task)."""
         import zmq.asyncio
 
-        # Demanded before anything is allocated, as the publisher does: on 3.12
-        # and 3.13 ensure_future does NOT refuse a caller with no running loop —
-        # it puts the reader on a dormant policy loop, which never runs it, so a
-        # live server's replies are never consumed and every call times out.
-        loop = asyncio.get_running_loop()
+        # Asked before anything is allocated — but a missing loop is not
+        # refused: 0.2.26 allowed start() outside any running loop, the policy
+        # loop driven with run_until_complete afterwards. The reader is
+        # DEFERRED instead: call() is a coroutine, so it always runs inside
+        # some running loop, and building the reader there — never here, where
+        # ensure_future on 3.12/3.13 would put it on a dormant policy loop that
+        # never runs it — is what keeps a live server's replies consumed.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
 
         # The lock is built BEFORE the transport: it is an allocation, and a
         # refusal after the open published the transport left it live behind
@@ -256,17 +267,19 @@ class ProcessBridge:
         )
         self._transport = transport
         self._send_lock = send_lock
-        try:
-            # Published first: with an eager task factory the reader runs inside
-            # create_task and must already see the transport. If it raises
-            # instead — an installed factory can refuse — nothing may stay
-            # claimed, or start() would no-op on the retry over a live
-            # transport nobody can reach.
-            reader = loop.create_task(self._read_responses(transport))
-        except BaseException:
-            self._transport = self._send_lock = None
-            transport.close()
-            raise
+        reader = None
+        if loop is not None:
+            try:
+                # Published first: with an eager task factory the reader runs
+                # inside create_task and must already see the transport. If it
+                # raises instead — an installed factory can refuse — nothing
+                # may stay claimed, or start() would no-op on the retry over a
+                # live transport nobody can reach.
+                reader = loop.create_task(self._read_responses(transport))
+            except BaseException:
+                self._transport = self._send_lock = None
+                transport.close()
+                raise
         self._started = True
         self._reader_task = reader
         self._loop = loop
