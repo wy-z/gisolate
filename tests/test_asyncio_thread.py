@@ -1,6 +1,7 @@
 """Tests for gisolate.asyncio_thread — one asyncio loop on one native thread."""
 
 import asyncio
+import collections.abc
 import subprocess
 import sys
 import textwrap
@@ -596,6 +597,55 @@ class TestLifecycle:
         gevent.sleep(0.1)  # the cleanup greenlet is up
         thread.stop()
         assert killed == [True]
+
+    def test_a_cancelled_coroutines_async_cleanup_completes_through_stop(self, thread):
+        """Cancelled with its own reason, a coroutine may still be in an
+        async cleanup when stop() arrives. The teardown must not cancel it
+        again: the cleanup completes, and its answer is delivered."""
+        tasks = []
+
+        async def cleanup_then_answer():
+            tasks.append(asyncio.current_task())
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)  # cleanup that yields
+                return 42
+
+        g = gevent.spawn(outcome, thread.call, cleanup_then_answer())
+        wait_for(tasks)
+        thread._loop.call_soon_threadsafe(tasks[0].cancel, "own reason")
+        gevent.sleep(0.05)  # in the cleanup
+        thread.stop()
+        assert g.get(timeout=2) == 42
+
+    def test_a_wrapped_coroutine_is_a_coroutine_too(self, thread):
+        """call() takes any Coroutine, not only a native one — including
+        through the teardown."""
+
+        class Wrapped(collections.abc.Coroutine):
+            def __init__(self, coro):
+                self._coro = coro
+
+            def send(self, value):
+                return self._coro.send(value)
+
+            def throw(self, *args):
+                return self._coro.throw(*args)
+
+            def close(self):
+                return self._coro.close()
+
+            def __await__(self):
+                return self._coro.__await__()
+
+        assert thread.call(Wrapped(add(2, 3))) == 5
+        g = gevent.spawn(
+            outcome, thread.call, Wrapped(thread.to_gevent(time.sleep, 10))
+        )
+        gevent.sleep(0.05)
+        thread.stop()
+        assert isinstance(g.get(timeout=2), LoopStopped)
 
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
