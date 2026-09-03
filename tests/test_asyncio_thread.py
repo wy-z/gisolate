@@ -117,11 +117,28 @@ class TestLoop:
                 loop = asyncio.get_running_loop()
                 fut = loop.run_in_executor(None, time.sleep, 0.2)
                 fut.add_done_callback(lambda f: loop.create_task(cleanup()))
+            async def immortal():
+                while True:
+                    try:
+                        await asyncio.sleep(10)
+                    except asyncio.CancelledError:
+                        pass
+            async def hold_executor():
+                asyncio.get_running_loop().run_in_executor(None, time.sleep, 3)
+            import gevent
+            from gisolate import asyncio_thread
+            asyncio_thread._UNWIND_GRACE = 0.5
             with AsyncioThread() as t:
                 assert t.call(asyncio.to_thread(time.sleep, 0.05)) is None
                 assert any("asyncio" in th.name for th in threading.enumerate())
                 t.call(late_spawner())
-            assert not any("asyncio" in th.name for th in threading.enumerate()), threading.enumerate()
+                t.call(hold_executor())  # an executor thread the shutdown cannot join in time
+                gevent.spawn(t.call, immortal())  # a task that eats the whole grace
+                gevent.sleep(0.05)
+                started = time.monotonic()
+                t.stop(timeout=5)
+                took = time.monotonic() - started
+                assert took < 0.8, took  # ONE grace bounds the whole teardown, executor included
             assert cleaned == [True], cleaned
             print("ok")
             """

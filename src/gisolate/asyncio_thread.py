@@ -139,7 +139,9 @@ def _close(loop, torn: set) -> None:
         _drain(loop, deadline, torn)  # a close may have spawned tasks of its own
         # An unpatched process may have used the default executor; its
         # threads must not outlive stop() — within reason.
-        loop.run_until_complete(loop.shutdown_default_executor(_UNWIND_GRACE))
+        loop.run_until_complete(
+            loop.shutdown_default_executor(max(0, deadline - time.monotonic()))
+        )
         _drain(loop, deadline, torn)  # so may a future of theirs, completing
     except BaseException:  # noqa: BLE001 — a raw native thread: logged is all there is
         log.exception("AsyncioThread: loop teardown failed")
