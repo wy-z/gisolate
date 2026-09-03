@@ -22,9 +22,10 @@ Two crossings, both bounded and cancellable from either side:
 
 import asyncio
 import contextvars
+import inspect
 import logging
-import time
 import select
+import time
 from typing import Any, Callable, Coroutine
 
 import _socket
@@ -151,14 +152,23 @@ def _close(loop) -> None:
 
 def _drain(loop, deadline: float) -> None:
     """Cancel every task and wait for it — again for those a cleanup spawned,
-    until none is left or the deadline is; one already being cancelled
-    keeps its own reason (asyncio would replace it with ours)."""
+    until none is left or the deadline is."""
     while (tasks := asyncio.all_tasks(loop)) and (
         left := deadline - time.monotonic()
     ) > 0:
         for task in tasks:
-            if not task.cancelling():
-                task.cancel(_TEARDOWN)
+            # A task not yet started that is already being cancelled keeps its
+            # own reason: cancelled again, asyncio would replace it with ours.
+            # A started one is cancelled regardless — its await may be a
+            # to_gevent, and that cancellation is what kills the greenlet.
+            coro = task.get_coro()
+            unstarted = (
+                coro is not None
+                and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+            )
+            if task.cancelling() and unstarted:
+                continue
+            task.cancel(_TEARDOWN)
         loop.run_until_complete(asyncio.wait(tasks, timeout=left))
 
 

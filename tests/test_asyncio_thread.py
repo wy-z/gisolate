@@ -574,6 +574,29 @@ class TestLifecycle:
         thread.stop()
         assert finished == [True]
 
+    def test_a_task_in_its_own_cancellations_cleanup_still_has_its_greenlet_killed(
+        self, thread
+    ):
+        """Cancelled with its own reason, a task may catch that and clean up
+        on gevent. The teardown must still cancel it — that is what kills
+        the cleanup's greenlet — even though it is already 'cancelling'."""
+        killed = []
+        tasks = []
+
+        async def cleanup_on_gevent():
+            tasks.append(asyncio.current_task())
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await thread.to_gevent(slow_until_killed, killed)
+
+        gevent.spawn(outcome, thread.call, cleanup_on_gevent())
+        wait_for(tasks)
+        thread._loop.call_soon_threadsafe(tasks[0].cancel, "own reason")
+        gevent.sleep(0.1)  # the cleanup greenlet is up
+        thread.stop()
+        assert killed == [True]
+
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
         gevent.sleep(0.05)
