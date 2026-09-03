@@ -307,7 +307,6 @@ class AsyncioThread:
             # cancelling, and its cleanup may be exactly such an await.
             for hub, kill in list(self._crossings.values()):
                 _schedule_on_hub(hub, kill)
-            self._crossings.clear()
             # Teardown BEFORE anyone is told the loop is gone: cancelling a task
             # queues the kill of the greenlet it awaited on its caller's hub,
             # and the caller — a one-shot native thread, say — takes that hub
@@ -315,11 +314,7 @@ class AsyncioThread:
             # follows its kill, in the same queue.
             if self._loop is not None:
                 _close(self._loop)
-            for hub, kill in list(
-                self._crossings.values()
-            ):  # entered meanwhile, not yet ended
-                _schedule_on_hub(hub, kill)
-            self._crossings.clear()
+            self._crossings.clear()  # what a crossing's own end did not pop: abandoned
             with self._lock:
                 self._state = DEAD
                 pending, self._pending = self._pending, set()
