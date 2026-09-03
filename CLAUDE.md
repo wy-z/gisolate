@@ -40,6 +40,7 @@ All source lives in `src/gisolate/`. Key modules:
 - **`pubsub.py`** — `ProcessPublisher` / `ProcessSubscriber`: one-way ZMQ PUB/SUB fan-out with topic-prefix handlers. Each side picks its runtime (gevent or asyncio) via the `runtime` kwarg; wire format is runtime-agnostic.
 - **`subprocess.py`** — `run_in_subprocess()`: simple one-shot function execution in a subprocess with gevent-safe polling via `multiprocessing.Pipe`.
 - **`local.py`** — `ThreadLocalProxy`: proxy with true thread-local isolation using unpatched `threading.local`.
+- **`asyncio_thread.py`** — `AsyncioThread`: one asyncio event loop on one native OS thread inside a gevent process. Greenlets `call(coro)` into it; coroutines `await to_gevent(fn)` back out. The loop is built on the unpatched `poll()` and `socketpair()` so it never touches a hub; both crossings are bounded and cancellable from either side.
 - **`hub.py`** — Marshals tasks to gevent's main event loop. Enables thread-safe operations from non-main threads via `run_on_main_hub()` / `spawn_on_main_hub()`.
 - **`_internal.py`** — Unpatched stdlib primitives (`threading.Event`, `threading.RLock`, etc. via `gevent.monkey.get_original`), custom exceptions (`ProcessError`, `RemoteError`), and `SmartPickle` (pickle-first, dill-fallback serializer).
 
