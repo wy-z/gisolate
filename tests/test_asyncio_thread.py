@@ -737,6 +737,28 @@ class TestLifecycle:
         thread.stop()
         assert isinstance(g.get(timeout=2), LoopStopped)
 
+    def test_a_tasks_own_greenlet_exit_during_stop_is_its_own_answer(self, thread):
+        """Handling its own cancellation, a task may end by raising a
+        GreenletExit of its own while stop() runs. That is its answer — only
+        a GreenletExit from a kill the teardown issued is LoopStopped."""
+        tasks = []
+
+        async def exits_itself():
+            tasks.append(asyncio.current_task())
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)  # the teardown arrives meanwhile
+                raise gevent.GreenletExit("mine") from None
+
+        g = gevent.spawn(outcome, thread.call, exits_itself())
+        wait_for(tasks)
+        thread._loop.call_soon_threadsafe(tasks[0].cancel, "own reason")
+        gevent.sleep(0.05)
+        thread.stop()
+        got = g.get(timeout=2)
+        assert isinstance(got, gevent.GreenletExit) and got.args == ("mine",)
+
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
         gevent.sleep(0.05)
