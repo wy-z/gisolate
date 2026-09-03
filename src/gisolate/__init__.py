@@ -5,8 +5,9 @@ Isolates libraries incompatible with gevent monkey-patching.
 """
 
 from ._internal import ProcessError, RemoteError, Serializer
+from .asyncio_thread import AsyncioThread, LoopStopped
 from .bridge import ProcessBridge
-from .hub import ensure_hub_started
+from .hub import WaitTimeout, ensure_hub_started
 from .hub import shutdown as shutdown_hub
 from .hub import spawn_on_main_hub
 from .local import ThreadLocalProxy
@@ -26,6 +27,8 @@ except Exception:
     pass
 
 __all__ = [
+    "AsyncioThread",
+    "LoopStopped",
     "ProcessBridge",
     "ProcessError",
     "ProcessProxy",
@@ -35,6 +38,7 @@ __all__ = [
     "RemoteError",
     "Serializer",
     "ThreadLocalProxy",
+    "WaitTimeout",
     "ensure_hub_started",
     "get_default_mp_context",
     "run_in_subprocess",

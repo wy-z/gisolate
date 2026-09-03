@@ -153,6 +153,11 @@ INTERRUPT_CONTAINED_ON_PURPOSE = {
     # socket for the proxy, the lease's last retry for the transport).
     ("proxy.py", "__del__"),
     ("_internal.py", "__del__"),
+    # A raw native thread (not a greenlet on a hub): no operator interrupt is
+    # ever raised there, and the gevent-side results it relays to are the only
+    # way out — re-raising would only skip the exit signal below the catch.
+    ("asyncio_thread.py", "_run"),
+    ("asyncio_thread.py", "_close"),
 }
 
 

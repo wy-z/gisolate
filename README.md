@@ -210,6 +210,26 @@ proxy = ThreadLocalProxy(create_client)
 proxy.query("SELECT 1")  # each real OS thread gets its own instance
 ```
 
+### AsyncioThread — asyncio on a native thread
+
+One asyncio loop on one real OS thread inside the gevent process — for a library that only speaks asyncio (an ASGI app, an async SDK's protocol engine) when a child process is too much. The loop is built on the unpatched `poll()` and `socketpair()`, so nothing in that thread ever waits on a gevent hub; application and network I/O stay on the gevent side. That is a boundary, not a convenience: an asyncio socket, or the `getaddrinfo` behind one, needs the loop's executor, which is refused (below) — hand the I/O to `to_gevent`.
+
+```python
+from gisolate import AsyncioThread
+
+aio = AsyncioThread().start()          # once per process, after any fork
+
+async def handle(payload):
+    # ... asyncio-only code ...
+    rows = await aio.to_gevent(query_db, payload)   # hop back: runs in a greenlet on the gevent thread
+    return rows
+
+result = aio.call(handle(payload), timeout=30)      # from any greenlet: blocks only that greenlet
+aio.stop()
+```
+
+Both crossings are bounded and cancellable from either side: a timeout, a `gevent.Timeout`, or a killed greenlet cancels the coroutine — and `call()` returns only once the loop has unwound it (a 6s grace bounds a coroutine that ignores cancellation), so the kill it queued for any greenlet it was awaiting has already landed on the caller's hub; a cancelled coroutine kills the greenlet it is awaiting. A loop that dies fails every in-flight `call()` with `LoopStopped`. `run_in_executor` / `asyncio.to_thread` are refused inside the loop while `threading` is monkey-patched — their worker would be a greenlet on the loop's own thread, which cannot run while the loop blocks in `poll()`; use `to_gevent` instead.
+
 ## Child Process Modes
 
 | `patch_kwargs`  | Child process runtime |
@@ -282,6 +302,18 @@ Anything with `dumps(obj) -> bytes` and `loads(bytes) -> obj` static methods can
 ### `ThreadLocalProxy(factory)`
 
 Transparent proxy delegating attribute access to a per-thread instance.
+
+### `AsyncioThread(*, start_timeout=10.0)`
+
+POSIX only (a native `socketpair` for the loop's wake-up pipe).
+
+- **`.start()`** / **`.stop(timeout=10.0)`** — start the loop thread (also a context manager); `stop()` cancels every task and fails in-flight calls with `LoopStopped` (a coroutine that finishes despite the cancellation still delivers its answer)
+- **`.call(coro, timeout=None)`** — run a coroutine on the loop from a greenlet; raises `WaitTimeout` on timeout and cancels the coroutine whenever the caller leaves early
+- **`await .to_gevent(fn, *args, **kwargs)`** — from the loop: run `fn` in a fresh greenlet on the thread that called in (the starting thread for tasks nobody called in); a killed greenlet raises `GreenletExit` here, a cancelled await kills the greenlet
+
+### `LoopStopped` / `WaitTimeout`
+
+`LoopStopped`: raised by `call()` when the loop is not running, or stopped before the call completed. `WaitTimeout`: `call()`'s timeout, exported here as well as from `gisolate.hub`.
 
 ### `ensure_hub_started()`
 
