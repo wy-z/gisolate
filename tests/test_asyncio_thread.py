@@ -759,6 +759,19 @@ class TestLifecycle:
         got = g.get(timeout=2)
         assert isinstance(got, gevent.GreenletExit) and got.args == ("mine",)
 
+    def test_a_greenlets_own_exit_racing_the_teardown_is_its_own_answer(self, thread):
+        """fn may set the teardown going and then exit with a GreenletExit
+        of its own — a crossing the teardown may sweep before the link has
+        settled it. Only a kill the teardown issued is LoopStopped."""
+
+        def exit_after_stopping():
+            gevent.spawn(thread.stop)
+            raise gevent.GreenletExit("mine")
+
+        g = gevent.spawn(outcome, thread.call, thread.to_gevent(exit_after_stopping))
+        got = g.get(timeout=3)
+        assert isinstance(got, gevent.GreenletExit) and got.args == ("mine",)
+
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
         gevent.sleep(0.05)
