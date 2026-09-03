@@ -647,6 +647,35 @@ class TestLifecycle:
         thread.stop()
         assert isinstance(g.get(timeout=2), LoopStopped)
 
+    def test_a_crossing_entered_during_the_teardown_is_ended_by_it(
+        self, thread, monkeypatch
+    ):
+        """A coroutine may answer the teardown's own cancellation by awaiting
+        to_gevent in its cleanup — a crossing that did not exist when the
+        teardown swept them. It is ended all the same, and nothing is kept."""
+        from gisolate import asyncio_thread
+
+        monkeypatch.setattr(asyncio_thread, "_UNWIND_GRACE", 0.5)
+        seen = []
+
+        def linger():
+            seen.append(gevent.getcurrent())
+            time.sleep(10)
+
+        async def cleanup_on_gevent():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await thread.to_gevent(linger)
+
+        g = gevent.spawn(outcome, thread.call, cleanup_on_gevent())
+        gevent.sleep(0.05)
+        thread.stop()
+        assert isinstance(g.get(timeout=2), LoopStopped)
+        gevent.sleep(0.05)
+        assert all(greenlet.dead for greenlet in seen)
+        assert thread._crossings == {}
+
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
         gevent.sleep(0.05)

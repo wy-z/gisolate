@@ -315,6 +315,11 @@ class AsyncioThread:
             # follows its kill, in the same queue.
             if self._loop is not None:
                 _close(self._loop)
+            for hub, kill in list(
+                self._crossings.values()
+            ):  # entered meanwhile, not yet ended
+                _schedule_on_hub(hub, kill)
+            self._crossings.clear()
             with self._lock:
                 self._state = DEAD
                 pending, self._pending = self._pending, set()
@@ -359,6 +364,9 @@ class AsyncioThread:
                     exc = LoopStopped("loop stopped before the call completed")
                 _schedule_on_hub(hub, _settle_once, result, result.set_exception, exc)
             elif (exc := t.exception()) is not None:
+                if self._closing and isinstance(exc, gevent.GreenletExit):
+                    # The teardown killed the greenlet it was awaiting.
+                    exc = LoopStopped("loop stopped before the call completed")
                 _schedule_on_hub(hub, _settle_once, result, result.set_exception, exc)
             else:
                 _schedule_on_hub(hub, _settle_once, result, result.set, t.result())
@@ -506,6 +514,10 @@ class AsyncioThread:
         _schedule_on_hub(hub, spawn)
         token = object()
         self._crossings[token] = (hub, kill)
+        if (
+            self._closing
+        ):  # entered from a cleanup the teardown is running: ended at once
+            _schedule_on_hub(hub, kill)
         try:
             return await fut
         except asyncio.CancelledError:
