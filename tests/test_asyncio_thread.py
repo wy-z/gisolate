@@ -105,10 +105,24 @@ class TestLoop:
             """
             import asyncio, threading, time
             from gisolate import AsyncioThread
+            cleaned = []
+            async def cleanup():
+                try:
+                    await asyncio.sleep(10)
+                finally:  # cancelled by the teardown, not destroyed pending
+                    cleaned.append(True)
+            async def late_spawner():
+                # An executor future completing during the executor's shutdown
+                # creates a task: the teardown must end that one too.
+                loop = asyncio.get_running_loop()
+                fut = loop.run_in_executor(None, time.sleep, 0.2)
+                fut.add_done_callback(lambda f: loop.create_task(cleanup()))
             with AsyncioThread() as t:
                 assert t.call(asyncio.to_thread(time.sleep, 0.05)) is None
                 assert any("asyncio" in th.name for th in threading.enumerate())
+                t.call(late_spawner())
             assert not any("asyncio" in th.name for th in threading.enumerate()), threading.enumerate()
+            assert cleaned == [True], cleaned
             print("ok")
             """
         )
@@ -488,6 +502,7 @@ class TestLifecycle:
         assert time.monotonic() - started < 3.0
         assert isinstance(g.get(timeout=2), LoopStopped)
         assert t._state == "dead"
+        assert t._torn == set() and t._crossings == {}  # the abandoned task is not kept
 
     def test_an_async_generator_that_never_finishes_closing_is_abandoned(
         self, monkeypatch
@@ -549,12 +564,25 @@ class TestLifecycle:
         thread.stop(timeout=2)
 
     def test_a_task_spawned_during_cleanup_is_finished_by_the_teardown_too(
-        self, thread
+        self, thread, monkeypatch
     ):
         """A cancelled coroutine's cleanup may spawn a task of its own. The
         teardown cannot stop at its first snapshot: that one must end
-        before the loop closes under it."""
+        before the loop closes under it — even while another task holds
+        out against its cancellation for the whole grace."""
+        from gisolate import asyncio_thread
+
+        monkeypatch.setattr(asyncio_thread, "_UNWIND_GRACE", 0.5)
         finished = []
+
+        async def immortal():
+            while True:
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    pass
+
+        gevent.spawn(outcome, thread.call, immortal())
 
         async def child():
             try:
@@ -675,6 +703,22 @@ class TestLifecycle:
         gevent.sleep(0.05)
         assert all(greenlet.dead for greenlet in seen)
         assert thread._crossings == {}
+
+    def test_a_translated_teardown_cancellation_is_still_loop_stopped(self, thread):
+        """A coroutine may catch the teardown's cancellation and raise a
+        CancelledError of its own words. The teardown cancelled it; the
+        answer is LoopStopped, not the words."""
+
+        async def translate():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise asyncio.CancelledError("translated") from None
+
+        g = gevent.spawn(outcome, thread.call, translate())
+        gevent.sleep(0.05)
+        thread.stop()
+        assert isinstance(g.get(timeout=2), LoopStopped)
 
     def test_stop_fails_pending_calls_and_refuses_new_ones(self, thread):
         g = gevent.spawn(outcome, thread.call, asyncio.sleep(10))
