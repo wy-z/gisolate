@@ -32,7 +32,9 @@ class ProcessBridge:
     :class:`gisolate.ProcessProxy` when calls must come from several threads.
 
     Args:
-        address: IPC address (e.g., "ipc:///tmp/rpc.sock").
+        address: ``ipc://`` address (e.g., "ipc:///tmp/rpc.sock"). Any other
+            transport is refused: the wire is unauthenticated pickle, so a
+            ``tcp://`` server would run code for whoever can reach the port.
         mode: ProcessBridge.Mode.SERVER or ProcessBridge.Mode.CLIENT — or the
             string either one is worth, since the enum accepts it.
     """
@@ -42,6 +44,10 @@ class ProcessBridge:
         CLIENT = "client"
 
     def __init__(self, address: str, mode: "ProcessBridge.Mode | str"):
+        # The scheme only, unlike serve(): a relative ipc path is the
+        # caller's working-directory business, not a network exposure.
+        if not address.startswith("ipc://"):
+            raise ValueError(f"ProcessBridge supports ipc:// addresses only, got {address!r}")
         self._addr = address
         # Normalised, because every dispatch below compares by identity: a
         # plain ``"client"`` would otherwise fall through to the server branch
@@ -58,8 +64,6 @@ class ProcessBridge:
         self._transport: _internal.ZmqTransport | None = None
 
     def __del__(self):
-        # try/except, not suppress: the guard is an allocation, and this is a
-        # cleanup path — see ZmqTransport.close for the rule.
         try:
             if getattr(self, "_started", False):
                 self.close()
@@ -329,8 +333,7 @@ class ProcessBridge:
             # The prelude allocates — a group, a semaphore, the handler's own
             # function object — and a refusal here died with _started still
             # true over the bound transport: start() no-opped for good. Same
-            # release the loop's own failure gets, allocating nothing on the
-            # way out.
+            # release the loop's own failure gets.
             if transport is self._transport:
                 self._started = False
                 self._transport = None

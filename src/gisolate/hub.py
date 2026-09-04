@@ -65,7 +65,7 @@ class AsyncResult:
 
 
 _lock = _internal.RLock()
-_started = False
+_closed = False  # shutdown() ran: nothing is marshaled after it, started or not
 _main_hub: Any = None
 
 
@@ -118,11 +118,11 @@ def ensure_hub_started() -> None:
     calls this, ensuring correct ownership when the proxy is created on
     the main thread.
     """
-    global _started, _main_hub
-    if _started:
+    global _main_hub
+    if _main_hub is not None or _closed:
         return
     with _lock:
-        if _started:
+        if _main_hub is not None or _closed:
             return
         if not gevent.get_hub().loop.default:
             raise RuntimeError(
@@ -130,14 +130,13 @@ def ensure_hub_started() -> None:
                 "Create your first ProcessProxy on the main thread."
             )
         _main_hub = gevent.get_hub()
-        _started = True
 
 
 def shutdown() -> None:
     """Stop accepting marshaled tasks. Safe to call multiple times."""
-    global _started
+    global _closed
     with _lock:
-        _started = False
+        _closed = True
 
 
 def _cleanup_resource_tracker() -> None:
@@ -172,7 +171,7 @@ def run_on_main_hub(func: Callable, timeout: float | None = None) -> Any:
     """
     ensure_hub_started()
     with _lock:
-        if not _started:
+        if _closed:
             raise RuntimeError("Hub is shutting down")
         ar = AsyncResult()
 
@@ -203,7 +202,7 @@ def spawn_on_main_hub(func: Callable, *args, **kwargs) -> None:
     """Schedule function on main hub without waiting. Thread-safe, fire-and-forget."""
     ensure_hub_started()
     with _lock:
-        if not _started:
+        if _closed:
             return
 
     def runner():

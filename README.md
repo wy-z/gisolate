@@ -268,6 +268,8 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 
 ### `ProcessBridge(address, mode)`
 
+`ipc://` only — the wire is unauthenticated pickle.
+
 - **`bridge.start()`** — start the bridge (idempotent, returns self)
 - **`bridge.address`** — IPC address
 - **`await bridge.call(func, *args, timeout=60, **kwargs)`** — async RPC call (client mode)
@@ -333,7 +335,9 @@ Wrapper for exceptions from the child process that can't be pickled. Preserves t
 
 ### `shutdown_hub()`
 
-Explicitly stop the internal gevent hub loop. Registered via `atexit` automatically.
+Stop accepting cross-thread marshaled tasks: afterwards `spawn_on_main_hub` drops
+its task and a proxy call from another thread raises `RuntimeError`. Registered
+via `atexit` automatically.
 
 ### `set_default_mp_context(ctx)` / `get_default_mp_context()`
 
@@ -341,21 +345,14 @@ Configure the default `multiprocessing` context for all proxies (default: `"spaw
 
 ## Note on `multiprocessing` and `__main__`
 
-`multiprocessing` spawn/forkserver children re-import the caller's `__main__` module. If your `main.py` has top-level side effects (e.g. `gevent.monkey.patch_all()`), these will re-execute in the child — causing double-patching warnings or import errors.
-
-**Best practice**: guard monkey-patching behind `__name__` and defer heavy imports:
-
-```python
-# main.py
-if __name__ == "__main__":
-    import gevent.monkey
-    gevent.monkey.patch_all()
-
-    import my_app
-    my_app.run()
-```
-
-Spawn children re-import `main.py` but skip the `__name__` block, avoiding side effects.
+gisolate children never re-import the caller's `__main__` module: the spawn
+preparation step that would do so is suppressed for the duration of each
+start, so top-level side effects in `main.py` (a `gevent.monkey.patch_all()`,
+say) do not run twice. The flip side is that nothing defined in `__main__`
+exists in the child: the factory itself travels by value, but every name it
+reaches for in `__main__` — a class it instantiates, a helper, a module
+imported there — is a `NameError` in the child. Keep the factory and what it
+uses in an importable module.
 
 ## Known limits
 

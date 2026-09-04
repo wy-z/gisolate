@@ -1,6 +1,8 @@
 pre-commit:
   commands:
+    ruff:
+      run: ruff check src/ tests/
+    isort:
+      run: isort --check src/
     pyright:
       run: pyright --level error .
-    pytest:
-      run: pytest

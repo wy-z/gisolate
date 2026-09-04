@@ -222,6 +222,18 @@ class TestProcessBridgeRPC:
         server.close()
 
 
+class TestAddressScheme:
+    def test_a_non_ipc_address_is_refused_before_anything_is_bound(self):
+        """The wire is unauthenticated pickle: a tcp:// server would run code
+        for anyone who can reach the port. Refused at construction. A relative
+        ipc path stays allowed — a consumer's default is one."""
+        with pytest.raises(ValueError, match="ipc"):
+            ProcessBridge("tcp://127.0.0.1:5555", ProcessBridge.Mode.SERVER)
+        with pytest.raises(ValueError, match="ipc"):
+            ProcessBridge("inproc://rpc", "client")
+        ProcessBridge("ipc://relative.sock", "client")
+
+
 class TestServerAddressOwnership:
     def test_closing_an_old_server_leaves_the_live_one_reachable(self):
         """libzmq unlinks an ipc path before binding it, so a replacement
@@ -468,16 +480,37 @@ class TestConcurrentClose:
         caller's enclosing timeout landing in the join would otherwise leave a
         live socket and context that neither a later close() nor __del__ comes
         back for."""
-        server = ProcessBridge(_make_addr(), mode=ProcessBridge.Mode.SERVER).start()
+        addr = _make_addr()
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER).start()
         assert server._transport is not None
         sock = server._transport.sock
-        # Let _serve reach its 100ms poll, so the close below really does wait
-        # on it and the timeout below really does land in the join.
-        gevent.sleep(0.01)
-        with pytest.raises(gevent.Timeout):
-            with gevent.Timeout(0.02):
-                server.close()
-        assert sock.closed
+        serving = server._server_greenlet
+        assert serving is not None
+        _ticks.clear()
+
+        async def go():
+            client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
+            try:
+                with contextlib.suppress(TimeoutError):
+                    await client.call(_tick_forever, timeout=1)
+            finally:
+                client.close()
+
+        try:
+            # A handler that never returns, so the close below really does
+            # wait — on _serve's group join — and the timeout really does land
+            # in it. Waiting on the 100ms poll instead was a race: a spurious
+            # FD wake let close() return before the 20ms had passed.
+            asyncio.run(go())
+            gevent.sleep(0.5)
+            assert _ticks, "the handler should be running"
+            with pytest.raises(gevent.Timeout):
+                with gevent.Timeout(0.02):
+                    server.close()
+            assert sock.closed
+            assert not server._started, "the interrupted closer never claimed the bridge"
+        finally:
+            serving.kill(block=True, timeout=2)  # ends the handler _serve is still joining
 
     def test_a_start_during_close_keeps_its_own_generation(self):
         """close() waits on the server greenlet, which switches. Reading the

@@ -521,8 +521,9 @@ class LateConnect:
     """Client whose synchronous connect() acquires its resource long after a
     teardown gives up on it — the executor thread cancellation cannot reach."""
 
-    def __init__(self, path):
+    def __init__(self, path, seconds):
         self.path = path
+        self.seconds = seconds
 
     def _mark(self, what):
         with open(self.path, "a") as f:
@@ -531,7 +532,7 @@ class LateConnect:
     def connect(self):
         import time
 
-        time.sleep(16.0)
+        time.sleep(self.seconds)
         self._mark("connected")  # the acquisition close() would be releasing
 
     def close(self):
@@ -541,8 +542,8 @@ class LateConnect:
         return "pong"
 
 
-def late_connect_factory(path):
-    return LateConnect(path)
+def late_connect_factory(path, seconds):
+    return LateConnect(path, seconds)
 
 
 class NestedProcessError:

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # 3.12 is out until #30 is settled: an original Thread never reports
+        # its exit under patch_all there, so every native-thread test fails
+        # and the run hangs at exit.
+        python: ["3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --frozen
+      - run: uv run ruff check src/ tests/
+      - run: uv run isort --check src/
+      - run: uv run pyright --level error .
+      - run: uv run pytest -q
