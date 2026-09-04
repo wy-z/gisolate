@@ -169,10 +169,6 @@ class TestInterruptedCleanup:
 
 
 class TestLargeResult:
-    @pytest.mark.skipif(
-        os.environ.get("CI") == "true",
-        reason="the 90ms bound needs a quiet machine: a shared runner stalled 109ms on the loads alone",
-    )
     def test_receiving_one_does_not_stop_the_hub(self):
         """poll(0) promises a byte, not a whole frame: recv_bytes then blocks
         until the last one arrives, on the fds _make_pipe deliberately leaves
@@ -196,7 +192,10 @@ class TestLargeResult:
 
         assert len(result) == size
         worst = max(b - a for a, b in zip(ticks, ticks[1:]))
-        assert worst < 0.09, f"hub stalled {worst * 1000:.0f}ms during the receive"
+        # The bound needs a quiet machine: a shared runner stalled 109ms on
+        # the loads alone. The transfer above still runs there.
+        if os.environ.get("CI") != "true":
+            assert worst < 0.09, f"hub stalled {worst * 1000:.0f}ms during the receive"
 
 
 class TestSaturatedThreadpool:
