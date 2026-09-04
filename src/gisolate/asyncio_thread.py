@@ -125,13 +125,13 @@ def _settle_once(result: gevent.event.AsyncResult, setter: Callable, value) -> N
         setter(value)
 
 
-def _close(loop, torn: set, answered: set) -> None:
+def _close(loop, torn: set, crossings: dict) -> None:
     """asyncio.run()'s teardown, bounded: a task that will not yield to its
     cancellation is abandoned after the grace, not waited on forever."""
     loop.set_task_factory(None)  # the teardown's own tasks, not a caller's factory
     deadline = time.monotonic() + _UNWIND_GRACE
     try:
-        _drain(loop, deadline, torn, answered)
+        _drain(loop, deadline, torn, crossings)
         # Open async generators, closed the same way: given the grace, then
         # abandoned. (Not wait_for: a close that swallows its cancellation
         # would hold that up too.)
@@ -141,21 +141,21 @@ def _close(loop, torn: set, answered: set) -> None:
         )
         closing.cancel()
         _drain(
-            loop, deadline, torn, answered
+            loop, deadline, torn, crossings
         )  # a close may have spawned tasks of its own
         # An unpatched process may have used the default executor; its
         # threads must not outlive stop() — within reason.
         loop.run_until_complete(
             loop.shutdown_default_executor(max(0, deadline - time.monotonic()))
         )
-        _drain(loop, deadline, torn, answered)  # so may a future of theirs, completing
+        _drain(loop, deadline, torn, crossings)  # so may a future of theirs, completing
     except BaseException:  # noqa: BLE001 — a raw native thread: logged is all there is
         log.exception("AsyncioThread: loop teardown failed")
     finally:
         loop.close()
 
 
-def _drain(loop, deadline: float, torn: set, answered: set) -> None:
+def _drain(loop, deadline: float, torn: set, crossings: dict) -> None:
     """Cancel every task and wait for it — in short slices, looking again
     each time, so a task that holds out cannot hide one a cleanup spawned
     meanwhile — until none is left or the deadline is."""
@@ -164,14 +164,14 @@ def _drain(loop, deadline: float, torn: set, answered: set) -> None:
     ) > 0:
         for task in tasks:
             # One already being cancelled keeps its own reason and its
-            # cleanup; a to_gevent it awaits is ended by the crossing's kill.
-            # One whose crossing has already answered finishes on its next step:
-            # cancelled now, asyncio would replace that answer with ours.
-            if task in answered:
+            # cleanup. One awaiting a to_gevent is ended by the crossing's
+            # kill: its hub runs that or the greenlet's own end first, and
+            # the task reads whichever it was — cancelled here, an answer
+            # already on its way would be replaced with ours.
+            if task in crossings or task.cancelling() or task in torn:
                 continue
-            if not task.cancelling() and task not in torn:
-                task.cancel()
-                torn.add(task)
+            task.cancel()
+            torn.add(task)
         loop.run_until_complete(asyncio.wait(tasks, timeout=min(left, 0.05)))
 
 
@@ -206,11 +206,8 @@ class AsyncioThread:
         self._hub: Any = None
         self._loop: Any = None
         self._closing = False  # loop thread only: teardown has begun
-        self._crossings: dict = {}  # loop thread only: (hub, kill) per active to_gevent, by future
+        self._crossings: dict = {}  # loop thread only: (hub, kill) per active to_gevent, by task
         self._torn: set = set()  # loop thread only: the tasks the teardown cancelled
-        self._answered: set = (
-            set()
-        )  # loop thread only: tasks whose crossing has settled, not yet read
         self._pending: set = set()  # (hub, result) of every in-flight call()
         self._stopped: list = []  # (hub, result) of every stop() waiting on exit
 
@@ -264,8 +261,9 @@ class AsyncioThread:
 
         The teardown's contract, and all of it:
 
-        - Every task is cancelled and every greenlet a ``to_gevent`` is
-          awaiting is killed — including ones created during the teardown.
+        - Every greenlet a ``to_gevent`` is awaiting is killed — including
+          ones created during the teardown — and every other task is
+          cancelled.
         - A call whose coroutine honours the cancellation raises
           :class:`LoopStopped`; one already handling a cancellation of its
           own keeps its cleanup and its own answer or reason; one whose
@@ -329,8 +327,9 @@ class AsyncioThread:
             with self._lock:
                 self._state = STOPPING  # no new calls; done() answers LoopStopped
             # Every greenlet a to_gevent is awaiting is killed now, on its
-            # hub — the teardown's cancellations do not reach a task already
-            # cancelling, and its cleanup may be exactly such an await.
+            # hub — the teardown cancels no task awaiting one: the kill, or
+            # the greenlet's own end, whichever its hub runs first, is what
+            # that task reads.
             for hub, kill in list(self._crossings.values()):
                 _schedule_on_hub(hub, kill, _TeardownExit)
             # Teardown BEFORE anyone is told the loop is gone: cancelling a task
@@ -339,7 +338,7 @@ class AsyncioThread:
             # with it the moment it has its answer. Each caller's answer
             # follows its kill, in the same queue.
             if self._loop is not None:
-                _close(self._loop, self._torn, self._answered)
+                _close(self._loop, self._torn, self._crossings)
             self._crossings.clear()  # what a crossing's own end did not pop: abandoned
             self._torn.clear()  # dead tasks, and through them callers' hubs: not ours to keep
             with self._lock:
@@ -481,8 +480,6 @@ class AsyncioThread:
             def settle():
                 if not target.done():  # the awaiter may already have left
                     setter(value)
-                    if target is fut:
-                        self._answered.add(task)  # the teardown leaves it to read this
 
             try:
                 loop.call_soon_threadsafe(settle)
@@ -537,7 +534,7 @@ class AsyncioThread:
                 greenlet.kill(exception, block=False)
 
         _schedule_on_hub(hub, spawn)
-        self._crossings[fut] = (hub, kill)
+        self._crossings[task] = (hub, kill)
         if (
             self._closing
         ):  # entered from a cleanup the teardown is running: ended at once
@@ -563,5 +560,4 @@ class AsyncioThread:
                     break
             raise
         finally:
-            self._crossings.pop(fut, None)
-            self._answered.discard(task)
+            self._crossings.pop(task, None)
