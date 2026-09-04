@@ -1156,8 +1156,16 @@ class TestFailedStartCleansUp:
             monkeypatch.undo()
 
             assert bound, "child never bound its socket"
+            # The detached cleanup unlinks the file a hub turn after the child
+            # is seen dead, so wait for both: checking the directory the
+            # instant the sentinel turned readable raced it (measured on
+            # Linux, where this greenlet won).
             for _ in range(60):
-                if children and _proc_exited(children[0]):
+                if (
+                    children
+                    and _proc_exited(children[0])
+                    and not set(os.listdir(proxy_mod._ZMQ_TMPDIR)) - before
+                ):
                     break
                 gevent.sleep(0.05)
             assert children and _proc_exited(children[0]), "child left running"
