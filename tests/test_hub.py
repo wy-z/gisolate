@@ -6,6 +6,7 @@ import textwrap
 
 import gevent
 import pytest
+from gisolate import hub
 from gisolate.hub import AsyncResult, run_on_main_hub, spawn_on_main_hub
 
 
@@ -191,3 +192,21 @@ class TestScheduleRefused:
         assert not t.is_alive(), "the waiter is still waiting"
         kind, value = outcome[0]
         assert kind == "raised" and isinstance(value, MemoryError), outcome
+
+
+class TestShutdown:
+    def test_it_is_terminal_for_the_marshal(self):
+        """shutdown() cleared a flag ensure_hub_started set again on the next
+        call, so it was a no-op the moment anything marshaled after it:
+        run_on_main_hub ran the task anyway instead of refusing as documented.
+        Terminal whether or not the hub was captured first."""
+        hub.shutdown()
+        try:
+            with pytest.raises(RuntimeError, match="shutting down"):
+                hub.run_on_main_hub(lambda: "ran anyway", timeout=2)
+            ran: list = []
+            hub.spawn_on_main_hub(ran.append, 1)
+            gevent.sleep(0.05)
+            assert ran == []
+        finally:
+            hub._closed = False  # re-arm for the rest of the suite

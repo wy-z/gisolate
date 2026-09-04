@@ -335,7 +335,9 @@ Wrapper for exceptions from the child process that can't be pickled. Preserves t
 
 ### `shutdown_hub()`
 
-Explicitly stop the internal gevent hub loop. Registered via `atexit` automatically.
+Stop accepting cross-thread marshaled tasks: afterwards `spawn_on_main_hub` drops
+its task and a proxy call from another thread raises `RuntimeError`. Registered
+via `atexit` automatically.
 
 ### `set_default_mp_context(ctx)` / `get_default_mp_context()`
 
