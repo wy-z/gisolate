@@ -480,16 +480,36 @@ class TestConcurrentClose:
         caller's enclosing timeout landing in the join would otherwise leave a
         live socket and context that neither a later close() nor __del__ comes
         back for."""
-        server = ProcessBridge(_make_addr(), mode=ProcessBridge.Mode.SERVER).start()
+        addr = _make_addr()
+        server = ProcessBridge(addr, mode=ProcessBridge.Mode.SERVER).start()
         assert server._transport is not None
         sock = server._transport.sock
-        # Let _serve reach its 100ms poll, so the close below really does wait
-        # on it and the timeout below really does land in the join.
-        gevent.sleep(0.01)
-        with pytest.raises(gevent.Timeout):
-            with gevent.Timeout(0.02):
-                server.close()
-        assert sock.closed
+        serving = server._server_greenlet
+        assert serving is not None
+        _ticks.clear()
+
+        async def go():
+            client = ProcessBridge(addr, mode=ProcessBridge.Mode.CLIENT)
+            try:
+                with contextlib.suppress(TimeoutError):
+                    await client.call(_tick_forever, timeout=1)
+            finally:
+                client.close()
+
+        try:
+            # A handler that never returns, so the close below really does
+            # wait — on _serve's group join — and the timeout really does land
+            # in it. Waiting on the 100ms poll instead was a race: a spurious
+            # FD wake let close() return before the 20ms had passed.
+            asyncio.run(go())
+            gevent.sleep(0.5)
+            assert _ticks, "the handler should be running"
+            with pytest.raises(gevent.Timeout):
+                with gevent.Timeout(0.02):
+                    server.close()
+            assert sock.closed
+        finally:
+            serving.kill(block=True, timeout=2)  # ends the handler _serve is still joining
 
     def test_a_start_during_close_keeps_its_own_generation(self):
         """close() waits on the server greenlet, which switches. Reading the
