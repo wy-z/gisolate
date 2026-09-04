@@ -169,6 +169,10 @@ class TestInterruptedCleanup:
 
 
 class TestLargeResult:
+    @pytest.mark.skipif(
+        os.environ.get("CI") == "true",
+        reason="the 90ms bound needs a quiet machine: a shared runner stalled 109ms on the loads alone",
+    )
     def test_receiving_one_does_not_stop_the_hub(self):
         """poll(0) promises a byte, not a whole frame: recv_bytes then blocks
         until the last one arrives, on the fds _make_pipe deliberately leaves
