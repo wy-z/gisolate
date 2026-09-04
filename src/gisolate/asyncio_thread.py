@@ -191,7 +191,6 @@ def _wait(result: gevent.event.AsyncResult, timeout: float | None) -> Any:
             raise WaitTimeout(f"Timed out after {timeout}s")
         return result.get()
     finally:
-        keep.stop()
         keep.close()
 
 
@@ -349,10 +348,8 @@ class AsyncioThread:
                 _close(self._loop, self._torn, self._crossings)
             self._crossings.clear()  # what a crossing's own end did not pop: abandoned
             self._torn.clear()  # dead tasks, and through them callers' hubs: not ours to keep
-            with self._lock:
-                self._state = DEAD
+            with self._lock:  # STOPPING still: no call() gets in, so this is all
                 pending, self._pending = self._pending, set()
-                stopped, self._stopped = self._stopped, []
             if not started.ready():  # a start() still waiting: the loop left first
                 exc = LoopStopped("stopped before start completed")
                 _schedule_on_hub(
@@ -361,11 +358,16 @@ class AsyncioThread:
             for hub, result in pending:  # calls the loop never got to
                 exc = LoopStopped("loop stopped before the call completed")
                 _schedule_on_hub(hub, _settle_once, result, result.set_exception, exc)
+            # DEAD with nothing of the thread left to see: a stop() that finds
+            # it returns at once; one that got in before waits here for it.
+            with self._lock:
+                self._state = DEAD
+                self._hub = self._loop = (
+                    None  # nothing keeps the starter's hub, or the loop
+                )
+                stopped, self._stopped = self._stopped, []
             for hub, exited in stopped:  # each stop() on its own hub
                 _schedule_on_hub(hub, exited.set)
-            self._hub = self._loop = (
-                None  # nothing keeps the starter's hub, or the loop
-            )
 
     # -- greenlet -> loop ---------------------------------------------------
 

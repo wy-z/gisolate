@@ -488,6 +488,34 @@ class TestLifecycle:
         # Nothing is owed to the starter's dead hub, and nothing keeps it.
         assert t._hub is None and t._loop is None
 
+    def test_dead_is_published_with_nothing_of_the_thread_left(self, monkeypatch):
+        """A stop() that finds DEAD returns at once, so by then the loop and
+        the starter's hub must be gone — checked from every hub wake the
+        teardown schedules, including the answer to a call the loop never
+        got to, the last of which answers the stop()."""
+        from gisolate import asyncio_thread
+
+        real = asyncio_thread._schedule_on_hub
+        seen = []
+
+        def observe(hub, fn, *args):
+            seen.append((t._state, t._hub is None and t._loop is None))
+            real(hub, fn, *args)
+
+        async def hog():
+            time.sleep(0.3)  # the loop thread is unpatched: this blocks it
+
+        t = AsyncioThread()  # bound before the loop thread first wakes a hub
+        monkeypatch.setattr(asyncio_thread, "_schedule_on_hub", observe)
+        t.start()
+        gevent.spawn(t.call, hog())
+        gevent.sleep(0.05)  # the hog is on the loop; what follows queues behind it
+        g = gevent.spawn(outcome, t.call, asyncio.sleep(10))
+        gevent.sleep(0)  # create() is queued — it will find the door closed
+        t.stop()
+        assert isinstance(g.get(timeout=2), LoopStopped)
+        assert [cleared for state, cleared in seen if state == "dead"] == [True]
+
     def test_a_stop_that_gives_up_leaves_no_waiter_behind(self, thread):
         async def stubborn():
             try:
