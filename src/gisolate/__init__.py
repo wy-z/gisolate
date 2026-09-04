@@ -17,15 +17,6 @@ from .pubsub import Runtime as PubSubRuntime
 from .server import serve
 from .subprocess import run_in_subprocess
 
-# Pre-initialize threadpoolctl on main thread to cache library info.
-# Avoids subprocess calls when sklearn runs in threadpool workers.
-try:
-    import threadpoolctl  # type: ignore[import-untyped]
-
-    threadpoolctl.ThreadpoolController()
-except Exception:
-    pass
-
 __all__ = [
     "AsyncioThread",
     "LoopStopped",
