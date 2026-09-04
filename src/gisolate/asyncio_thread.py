@@ -399,8 +399,8 @@ class AsyncioThread:
             try:
                 t = loop.create_task(coro, context=context)
             except BaseException as e:  # noqa: BLE001 — a task factory that raises, say
-                coro.close()
                 _schedule_on_hub(hub, _settle_once, result, result.set_exception, e)
+                coro.close()  # after the answer: a close that raises must not eat it
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
                     raise  # the operator's: told to the caller AND passed on
                 return
