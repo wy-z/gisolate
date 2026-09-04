@@ -61,19 +61,12 @@ class _TeardownExit(gevent.GreenletExit):
     """The kill the teardown issues — told apart from a greenlet's own exit."""
 
 
-if hasattr(select, "poll"):
+if hasattr(select, "poll"):  # not Windows, where start() refuses anyway
 
     class _RawSelector(gevent.monkey.get_original("selectors", "PollSelector")):  # type: ignore[misc]
         """stdlib PollSelector on the unpatched poll(): no hub involvement."""
 
         _selector_cls = gevent.monkey.get_original("select", "poll")
-
-else:  # Windows: select() only, and the loop watches one fd anyway
-    _select = gevent.monkey.get_original("select", "select")
-
-    class _RawSelector(gevent.monkey.get_original("selectors", "SelectSelector")):  # type: ignore[misc,no-redef]
-        def _select(self, r, w, x, timeout=None):
-            return _select(r, w, x, timeout)
 
 
 class _Loop(asyncio.SelectorEventLoop):
@@ -499,10 +492,10 @@ class AsyncioThread:
 
         def finish(g):  # link callback, gevent thread
             if (exc := g.exception) is not None:
-                if not isinstance(exc, Exception):
-                    # Forwarded to the main greenlet already; asyncio would
-                    # let it take the loop down too.
-                    exc = RuntimeError(f"{type(exc).__name__} escaped the greenlet")
+                # KeyboardInterrupt or SystemExit — all run() lets out —
+                # forwarded to the main greenlet already; asyncio would let
+                # it take the loop down too.
+                exc = RuntimeError(f"{type(exc).__name__} escaped the greenlet")
                 settle_on_loop(fut, fut.set_exception, exc)
             elif isinstance(g.value, gevent.GreenletExit):
                 settle_on_loop(fut, fut.set_exception, g.value)
