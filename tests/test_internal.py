@@ -86,23 +86,6 @@ class TestSmartPickle:
         restored = SmartPickle.loads(data)
         assert restored(10) == 11
 
-    def test_remembers_dill_types(self):
-        """After first dill fallback, same type goes directly to dill."""
-        # Lambda type is not picklable by stdlib, but dill handles it.
-        # After first attempt, SmartPickle should remember to use dill.
-        fn = lambda: 99  # noqa: E731
-        SmartPickle._dill_types.discard(type(fn))
-        SmartPickle.dumps(fn)
-        assert type(fn) in SmartPickle._dill_types
-
-    def test_builtin_containers_not_cached(self):
-        """Builtin containers should not be added to _dill_types even on fallback."""
-        before = SmartPickle._dill_types.copy()
-        # A list containing a lambda forces dill, but list type shouldn't be cached
-        SmartPickle.dumps([lambda: None])
-        assert list not in SmartPickle._dill_types
-        SmartPickle._dill_types = before
-
 
 # ---------------------------------------------------------------------------
 # wrap_exception
@@ -479,28 +462,6 @@ class TestIpcLease:
         assert bystander.exists()
 
 
-class TestDillTypeCache:
-    def test_it_does_not_retain_a_type_that_is_gone(self):
-        """The cache remembers which types need dill, and a dead type needs
-        nothing. A client returning a freshly built local class per call would
-        otherwise add one entry per call and keep every one of those classes
-        alive for the life of the worker."""
-        import gc
-
-        def make_local_class():
-            class Dynamic:  # local, so pickle cannot find it by name
-                pass
-
-            return Dynamic
-
-        before = len(SmartPickle._dill_types)
-        for _ in range(20):
-            payload = SmartPickle.dumps(make_local_class()())
-            assert payload[:1] == b"D"  # it really took the dill path
-        gc.collect()
-
-        # At most the one the loop's last iteration may still be holding.
-        assert len(SmartPickle._dill_types) - before <= 1
 
 
 class TestClaimWithoutAStat:

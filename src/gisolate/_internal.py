@@ -4,7 +4,6 @@ import contextlib
 import logging
 import os
 import pickle
-import weakref
 from typing import Any, Callable, Iterable, Protocol
 
 import dill
@@ -58,30 +57,19 @@ class Serializer(Protocol):
 
 
 class SmartPickle:
-    """Serializer preferring pickle, falling back to dill. Learns from failures.
+    """Serializer preferring pickle, falling back to dill.
 
     Implements the :class:`Serializer` protocol.
     """
 
     _PICKLE = b"P"
     _DILL = b"D"
-    # Weak, because the cache exists to remember which types need dill and a
-    # dead type needs nothing: a client returning a freshly built local class
-    # per call would otherwise add one entry per call and keep every one of
-    # those classes alive for the life of the worker.
-    _dill_types: "weakref.WeakSet[type]" = weakref.WeakSet()
-    _BUILTIN_CONTAINERS = frozenset({list, tuple, dict, set, frozenset})
 
     @classmethod
     def dumps(cls, obj: Any) -> bytes:
-        if type(obj) in cls._dill_types:
-            return cls._DILL + dill.dumps(obj)
         try:
             return cls._PICKLE + pickle.dumps(obj, protocol=5)
         except (pickle.PicklingError, TypeError, AttributeError):
-            t = type(obj)
-            if t not in cls._BUILTIN_CONTAINERS:
-                cls._dill_types.add(t)
             return cls._DILL + dill.dumps(obj)
 
     @classmethod
