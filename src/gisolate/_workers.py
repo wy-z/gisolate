@@ -24,6 +24,12 @@ SHUTDOWN = b""
 
 ID_MASK = 0xFFFFFFFFFFFFFFFF
 
+# The teardown's graces: how long in-flight handlers get before what is left is
+# killed or cancelled, and then how long the one client build (never cancelled)
+# gets before it is abandoned. Module attributes so a test can shorten them.
+_HANDLER_DRAIN_GRACE = 6.0
+_BUILD_DRAIN_GRACE = 6.0
+
 # Serialized once, at import, so the path that answers a failed serialization
 # never has to serialize anything itself.
 _LAST_RESORT = _internal.SmartPickle.dumps(
@@ -310,7 +316,7 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
         # serve() in, lands in the join below — and under serve() no process
         # exit follows to reclaim what that skips.
         try:
-            handlers.join(timeout=6)
+            handlers.join(timeout=_HANDLER_DRAIN_GRACE)
         finally:
             # Before the kill, so a wake the kill batch cannot outrun reads it.
             stopping = True
@@ -604,13 +610,13 @@ def asyncio_worker(cfg: WorkerConfig):
 
             # Drained in a loop, not one snapshot: asyncio.wait fixes its set
             # at the call, and finishing tasks make more.
-            # Six seconds of grace, not a bound on returning: asyncio.run
+            # A grace, not a bound on returning: asyncio.run
             # cancels whatever is left and then waits for it with no timeout of
             # its own, so a handler that swallows its cancellation holds serve()
             # open for as long as it likes — the same cooperative limit off_loop
             # names for executor work, and unfixable in-process. A spawned
             # worker has the bound its parent's terminate/kill gives it.
-            drain_until = time.monotonic() + 6
+            drain_until = time.monotonic() + _HANDLER_DRAIN_GRACE
             while tasks and (remaining := drain_until - time.monotonic()) > 0:
                 await asyncio.wait(set(tasks), timeout=remaining)
         finally:
@@ -625,7 +631,7 @@ def asyncio_worker(cfg: WorkerConfig):
                 # cancelled, so an ordinary async factory waiting on a network
                 # that never arrives is not the swallow-your-cancellation case
                 # above — nothing would ever end it, and serve() would never
-                # return. Six seconds beyond the drain's, after which the client
+                # return. A second grace beyond the drain's, after which the client
                 # such a build may still produce is lost, which is the same cost
                 # off_loop already names for work it cannot stop.
                 pending = build
@@ -653,7 +659,7 @@ def asyncio_worker(cfg: WorkerConfig):
                         # wait(), not await: it neither cancels nor raises —
                         # and while it parks, the cancelled handlers get the
                         # loop to unwind through their own finallys.
-                        await asyncio.wait({pending}, timeout=6)
+                        await asyncio.wait({pending}, timeout=_BUILD_DRAIN_GRACE)
                     if (
                         pending.done()
                         and not pending.cancelled()

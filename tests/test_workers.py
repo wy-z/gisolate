@@ -6,6 +6,7 @@ import pathlib
 import time
 
 
+from gisolate import _workers
 from gisolate._internal import SmartPickle
 from gisolate._workers import (ERR, OK, SHUTDOWN, _malformed, safe_close,
                                safe_dumps)
@@ -155,7 +156,7 @@ class TestTeardownOutlivesTheClient:
 
 
 class TestStragglingHandlers:
-    def test_a_handler_outliving_the_join_is_stopped(self):
+    def test_a_handler_outliving_the_join_is_stopped(self, monkeypatch):
         """The worker loop is not followed by a process exit under serve(): a
         handler still running when it returns holds the old client and goes on
         producing side effects for a host that has already moved on."""
@@ -170,6 +171,7 @@ class TestStragglingHandlers:
 
         from .helpers import _worker_ticks, ticker_factory
 
+        monkeypatch.setattr(_workers, "_HANDLER_DRAIN_GRACE", 0.5)
         addr = f"ipc://{tempfile.gettempdir()}/gi-worker-{uuid.uuid4().hex}.sock"
         worker = gevent.spawn(
             gevent_worker,
@@ -184,7 +186,7 @@ class TestStragglingHandlers:
                     break
                 gevent.sleep(0.05)
             client.connect(addr)
-            # A deadline far past the worker's own six-second join, so only the
+            # A deadline far past the worker's own join, so only the
             # kill after it can end this call.
             req = SmartPickle.dumps(("tick_forever", (), {}, time.monotonic() + 120))
             client.send_multipart([(1).to_bytes(8), req])
@@ -208,7 +210,7 @@ class TestStragglingHandlers:
             with contextlib.suppress(OSError):
                 os.unlink(addr.removeprefix("ipc://"))
 
-    def test_the_client_closes_only_after_the_stragglers_unwind(self):
+    def test_the_client_closes_only_after_the_stragglers_unwind(self, monkeypatch):
         """kill() SCHEDULES the GreenletExit; it does not deliver it. Closing
         the client in the next statement therefore ran the client's own close()
         while a handler was still in its finally — cleaning up against the
@@ -224,6 +226,7 @@ class TestStragglingHandlers:
 
         from .helpers import _unwind_order, unwind_order_factory
 
+        monkeypatch.setattr(_workers, "_HANDLER_DRAIN_GRACE", 0.5)
         addr = f"ipc://{tempfile.gettempdir()}/gi-unwind-{uuid.uuid4().hex[:8]}.sock"
         worker = gevent.spawn(
             gevent_worker,
@@ -238,7 +241,7 @@ class TestStragglingHandlers:
                     break
                 gevent.sleep(0.05)
             client.connect(addr)
-            # Past the worker's own six-second join, so only the kill ends it.
+            # Past the worker's own join, so only the kill ends it.
             req = SmartPickle.dumps(("wait_forever", (), {}, time.monotonic() + 120))
             client.send_multipart([(1).to_bytes(8), req])
             gevent.sleep(0.5)  # let the call start
@@ -256,7 +259,7 @@ class TestStragglingHandlers:
                 os.unlink(addr.removeprefix("ipc://"))
 
     def test_a_worker_killed_mid_join_still_releases_the_transport(self):
-        """The six-second join is a switch point, and under serve() nothing
+        """The teardown join is a switch point, and under serve() nothing
         follows this loop: a host killing the greenlet it ran serve() in left
         the ROUTER and its context open, with peers still connected."""
         import tempfile
@@ -329,7 +332,7 @@ class TestStragglingHandlers:
 
 
 class TestAsyncioWorkerReturns:
-    def test_a_build_that_never_finishes_does_not_hold_the_worker(self):
+    def test_a_build_that_never_finishes_does_not_hold_the_worker(self, monkeypatch):
         """The build is shielded, so it is never cancelled — an ordinary async
         connect() waiting on something that never arrives is not the
         swallow-your-cancellation case, and an unbounded teardown join means
@@ -347,6 +350,8 @@ class TestAsyncioWorkerReturns:
 
         from .helpers import never_connects_factory
 
+        monkeypatch.setattr(_workers, "_HANDLER_DRAIN_GRACE", 0.5)
+        monkeypatch.setattr(_workers, "_BUILD_DRAIN_GRACE", 0.5)
         Thread = gevent.monkey.get_original("threading", "Thread")
         addr = f"ipc://{tempfile.gettempdir()}/gi-async-{uuid.uuid4().hex[:8]}.sock"
         worker = Thread(
@@ -387,7 +392,7 @@ class TestAsyncioWorkerReturns:
 
 
 class TestBuildCancelledAtTeardown:
-    def test_close_never_precedes_the_connect_it_would_release(self, tmp_path):
+    def test_close_never_precedes_the_connect_it_would_release(self, tmp_path, monkeypatch):
         """Past the teardown join, asyncio.run cancels the build — but off_loop
         runs a synchronous connect where cancellation does not reach. Treating
         that cancellation as a failed connect closed the client before it had
@@ -406,6 +411,8 @@ class TestBuildCancelledAtTeardown:
 
         from .helpers import late_connect_factory
 
+        monkeypatch.setattr(_workers, "_HANDLER_DRAIN_GRACE", 0.5)
+        monkeypatch.setattr(_workers, "_BUILD_DRAIN_GRACE", 0.5)
         Thread = gevent.monkey.get_original("threading", "Thread")
         marker = tmp_path / "events.txt"
         addr = f"ipc://{tempfile.gettempdir()}/gi-late-{uuid.uuid4().hex[:8]}.sock"
@@ -415,7 +422,7 @@ class TestBuildCancelledAtTeardown:
                 WorkerConfig(
                     ipc_addr=addr,
                     factory_bytes=dill.dumps(
-                        functools.partial(late_connect_factory, str(marker))
+                        functools.partial(late_connect_factory, str(marker), 3.0)
                     ),
                 ),
             ),
@@ -441,8 +448,11 @@ class TestBuildCancelledAtTeardown:
                 gevent.sleep(0.1)
             assert not worker.is_alive(), "the worker never returned"
 
+            # The executor thread is joined before asyncio.run returns, so the
+            # connect has landed by now; asserting it PRESENT is what keeps an
+            # empty marker from passing.
             events = marker.read_text().split() if marker.exists() else []
-            assert "closed" not in events, f"closed before connecting: {events}"
+            assert events == ["connected"], f"closed before connecting: {events}"
         finally:
             client.close(linger=0)
             ctx.term()
@@ -544,15 +554,17 @@ class TestHandlersStopBeforeDispose:
             import dill
             import zmq
 
+            from gisolate import _workers
             from gisolate._internal import SmartPickle
             from gisolate._workers import SHUTDOWN, WorkerConfig, asyncio_worker
             from tests.helpers import slow_build_marker
 
+            _workers._HANDLER_DRAIN_GRACE = 1.0  # the build below outlasts it
             addr = {addr!r}
             cfg = WorkerConfig(
                 ipc_addr=addr,
                 factory_bytes=dill.dumps(
-                    functools.partial(slow_build_marker, {str(marker)!r}, 7.0)
+                    functools.partial(slow_build_marker, {str(marker)!r}, 2.0)
                 ),
             )
             worker = threading.Thread(target=asyncio_worker, args=(cfg,), daemon=True)
