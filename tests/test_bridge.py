@@ -508,6 +508,7 @@ class TestConcurrentClose:
                 with gevent.Timeout(0.02):
                     server.close()
             assert sock.closed
+            assert not server._started, "the interrupted closer never claimed the bridge"
         finally:
             serving.kill(block=True, timeout=2)  # ends the handler _serve is still joining
 
