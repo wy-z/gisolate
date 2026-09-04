@@ -348,6 +348,34 @@ class TestToGevent:
         with pytest.raises(RuntimeError):
             asyncio.run(thread.to_gevent(lambda: 1))
 
+    def test_blocking_on_the_loops_own_thread_is_refused(self, thread):
+        """call() and stop() block their thread until the loop answers; from
+        the loop's own thread that is a deadlock — stop() would also have
+        closed the door before it. Refused at once, nothing changed."""
+
+        async def stop_from_inside():
+            thread.stop()
+
+        async def call_from_inside():
+            thread.call(add(1, 1))
+
+        with pytest.raises(RuntimeError, match="to_gevent"):
+            thread.call(stop_from_inside())
+        with pytest.raises(RuntimeError, match="to_gevent"):
+            thread.call(call_from_inside())
+        assert thread.call(add(1, 1)) == 2
+
+    def test_another_loops_thread_may_use_it(self):
+        """Only the loop's own thread is refused: from a thread running some
+        other asyncio loop, start(), call() and stop() merely stall that loop
+        meanwhile — its caller's business."""
+
+        async def use_one():
+            with AsyncioThread() as t:
+                return t.call(add(1, 1))
+
+        assert asyncio.run(use_one()) == 2
+
 
 class TestLifecycle:
     def test_start_twice_raises(self, thread):

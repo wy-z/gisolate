@@ -167,6 +167,14 @@ def _drain(loop, deadline: float, torn: set, crossings: dict) -> None:
         loop.run_until_complete(asyncio.wait(tasks, timeout=min(left, 0.05)))
 
 
+# call() and stop() block their thread until the loop answers: on the loop's
+# own thread, a deadlock. (Another loop's thread is only stalled meanwhile —
+# that caller's business.)
+_ON_OWN_LOOP = (
+    "AsyncioThread.call/stop from the loop's own thread would block it: use to_gevent"
+)
+
+
 def _wait(result: gevent.event.AsyncResult, timeout: float | None) -> Any:
     """Wait on a result another thread will set, without the hub giving up.
 
@@ -269,6 +277,8 @@ class AsyncioThread:
         Nothing beyond that is promised for a coroutine that resists its
         cancellation; ``timeout`` bounds this call's own wait.
         """
+        if self._on_own_loop():
+            raise RuntimeError(_ON_OWN_LOOP)
         exited = gevent.event.AsyncResult()
         with self._lock:
             if self._state in (NEW, DEAD):
@@ -288,6 +298,10 @@ class AsyncioThread:
             with self._lock:
                 if waiter in self._stopped:  # left early: the teardown owes it nothing
                     self._stopped.remove(waiter)
+
+    def _on_own_loop(self) -> bool:
+        running = asyncio._get_running_loop()
+        return running is not None and running is self._loop
 
     def _stop_loop(self):  # loop thread
         # A stop() may have queued this while the loop was already on its way
@@ -362,6 +376,9 @@ class AsyncioThread:
         — timeout, ``gevent.Timeout``, the greenlet being killed — cancels the
         coroutine on the loop, and returns only once the loop has unwound it.
         """
+        if self._on_own_loop():
+            coro.close()
+            raise RuntimeError(_ON_OWN_LOOP)
         hub = gevent.get_hub()
         result = gevent.event.AsyncResult()
         context = contextvars.copy_context()
