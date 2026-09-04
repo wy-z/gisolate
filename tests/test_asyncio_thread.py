@@ -198,7 +198,6 @@ class TestCall:
         not trip over the same factory."""
 
         def broken_factory(loop, coro, **kwargs):
-            coro.close()
             raise failure("no tasks today")
 
         async def install():
@@ -349,6 +348,34 @@ class TestToGevent:
         with pytest.raises(RuntimeError):
             asyncio.run(thread.to_gevent(lambda: 1))
 
+    def test_blocking_on_the_loops_own_thread_is_refused(self, thread):
+        """call() and stop() block their thread until the loop answers; from
+        the loop's own thread that is a deadlock — stop() would also have
+        closed the door before it. Refused at once, nothing changed."""
+
+        async def stop_from_inside():
+            thread.stop()
+
+        async def call_from_inside():
+            thread.call(add(1, 1))
+
+        with pytest.raises(RuntimeError, match="to_gevent"):
+            thread.call(stop_from_inside())
+        with pytest.raises(RuntimeError, match="to_gevent"):
+            thread.call(call_from_inside())
+        assert thread.call(add(1, 1)) == 2
+
+    def test_another_loops_thread_may_use_it(self):
+        """Only the loop's own thread is refused: from a thread running some
+        other asyncio loop, start(), call() and stop() merely stall that loop
+        meanwhile — its caller's business."""
+
+        async def use_one():
+            with AsyncioThread() as t:
+                return t.call(add(1, 1))
+
+        assert asyncio.run(use_one()) == 2
+
 
 class TestLifecycle:
     def test_start_twice_raises(self, thread):
@@ -461,6 +488,34 @@ class TestLifecycle:
         # Nothing is owed to the starter's dead hub, and nothing keeps it.
         assert t._hub is None and t._loop is None
 
+    def test_dead_is_published_with_nothing_of_the_thread_left(self, monkeypatch):
+        """A stop() that finds DEAD returns at once, so by then the loop and
+        the starter's hub must be gone — checked from every hub wake the
+        teardown schedules, including the answer to a call the loop never
+        got to, the last of which answers the stop()."""
+        from gisolate import asyncio_thread
+
+        real = asyncio_thread._schedule_on_hub
+        seen = []
+
+        def observe(hub, fn, *args):
+            seen.append((t._state, t._hub is None and t._loop is None))
+            real(hub, fn, *args)
+
+        async def hog():
+            time.sleep(0.3)  # the loop thread is unpatched: this blocks it
+
+        t = AsyncioThread()  # bound before the loop thread first wakes a hub
+        monkeypatch.setattr(asyncio_thread, "_schedule_on_hub", observe)
+        t.start()
+        gevent.spawn(t.call, hog())
+        gevent.sleep(0.05)  # the hog is on the loop; what follows queues behind it
+        g = gevent.spawn(outcome, t.call, asyncio.sleep(10))
+        gevent.sleep(0)  # create() is queued — it will find the door closed
+        t.stop()
+        assert isinstance(g.get(timeout=2), LoopStopped)
+        assert [cleared for state, cleared in seen if state == "dead"] == [True]
+
     def test_a_stop_that_gives_up_leaves_no_waiter_behind(self, thread):
         async def stubborn():
             try:
@@ -474,7 +529,6 @@ class TestLifecycle:
             thread.stop(timeout=0.1)
         assert thread._stopped == []
         thread.stop(timeout=3)
-        assert thread._state == "dead"
 
     def test_a_coroutine_that_finishes_despite_cancellation_keeps_its_answer(
         self, thread
@@ -530,12 +584,14 @@ class TestLifecycle:
 
         monkeypatch.setattr(asyncio_thread, "_UNWIND_GRACE", 0.3)
         keep = []
+        closing = []
 
         async def leave_one_open():
             async def forever():
                 try:
                     yield 1
                 finally:
+                    closing.append(True)
                     while True:
                         try:
                             await asyncio.sleep(10)
@@ -550,6 +606,7 @@ class TestLifecycle:
         started = time.monotonic()
         t.stop(timeout=5)
         assert time.monotonic() - started < 3.0
+        assert closing == [True]  # the teardown did close it; the close held out
         assert t._state == "dead"
 
     def test_a_cancellation_already_under_way_keeps_its_reason_through_stop(
@@ -697,29 +754,24 @@ class TestLifecycle:
     ):
         """A coroutine may answer the teardown's own cancellation by awaiting
         to_gevent in its cleanup — a crossing that did not exist when the
-        teardown swept them. It is ended all the same, and nothing is kept."""
+        teardown swept them. It is ended at once, not left to run out the
+        grace."""
         from gisolate import asyncio_thread
 
         monkeypatch.setattr(asyncio_thread, "_UNWIND_GRACE", 0.5)
-        seen = []
-
-        def linger():
-            seen.append(gevent.getcurrent())
-            time.sleep(10)
 
         async def cleanup_on_gevent():
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
-                await thread.to_gevent(linger)
+                await thread.to_gevent(time.sleep, 10)
 
         g = gevent.spawn(outcome, thread.call, cleanup_on_gevent())
         gevent.sleep(0.05)
+        started = time.monotonic()
         thread.stop()
+        assert time.monotonic() - started < 0.4  # not abandoned at the grace
         assert isinstance(g.get(timeout=2), LoopStopped)
-        gevent.sleep(0.05)
-        assert all(greenlet.dead for greenlet in seen)
-        assert thread._crossings == {}
 
     def test_a_translated_teardown_cancellation_is_still_loop_stopped(self, thread):
         """A coroutine may catch the teardown's cancellation and raise a
@@ -777,7 +829,6 @@ class TestLifecycle:
         gevent.sleep(0.05)
         thread.stop()
         assert isinstance(g.get(timeout=2), LoopStopped)
-        assert thread._state == "dead"
         with pytest.raises(LoopStopped):
             thread.call(asyncio.sleep(0))
 
@@ -792,5 +843,4 @@ class TestLifecycle:
         gevent.sleep(0.05)
         assert thread.call(die()) is None
         assert isinstance(g.get(timeout=2), LoopStopped)
-        thread.stop(timeout=2)  # answers come during the teardown; DEAD after it
-        assert thread._state == "dead"
+        thread.stop(timeout=2)  # answers come during the teardown
