@@ -268,6 +268,8 @@ Run a function in an isolated subprocess. Blocks with gevent-safe polling.
 
 ### `ProcessBridge(address, mode)`
 
+`ipc://` only — the wire is unauthenticated pickle.
+
 - **`bridge.start()`** — start the bridge (idempotent, returns self)
 - **`bridge.address`** — IPC address
 - **`await bridge.call(func, *args, timeout=60, **kwargs)`** — async RPC call (client mode)

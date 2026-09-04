@@ -32,7 +32,9 @@ class ProcessBridge:
     :class:`gisolate.ProcessProxy` when calls must come from several threads.
 
     Args:
-        address: IPC address (e.g., "ipc:///tmp/rpc.sock").
+        address: ``ipc://`` address (e.g., "ipc:///tmp/rpc.sock"). Any other
+            transport is refused: the wire is unauthenticated pickle, so a
+            ``tcp://`` server would run code for whoever can reach the port.
         mode: ProcessBridge.Mode.SERVER or ProcessBridge.Mode.CLIENT — or the
             string either one is worth, since the enum accepts it.
     """
@@ -42,6 +44,10 @@ class ProcessBridge:
         CLIENT = "client"
 
     def __init__(self, address: str, mode: "ProcessBridge.Mode | str"):
+        # The scheme only, unlike serve(): a relative ipc path is the
+        # caller's working-directory business, not a network exposure.
+        if not address.startswith("ipc://"):
+            raise ValueError(f"ProcessBridge supports ipc:// addresses only, got {address!r}")
         self._addr = address
         # Normalised, because every dispatch below compares by identity: a
         # plain ``"client"`` would otherwise fall through to the server branch

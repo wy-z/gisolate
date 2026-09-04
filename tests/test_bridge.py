@@ -222,6 +222,18 @@ class TestProcessBridgeRPC:
         server.close()
 
 
+class TestAddressScheme:
+    def test_a_non_ipc_address_is_refused_before_anything_is_bound(self):
+        """The wire is unauthenticated pickle: a tcp:// server would run code
+        for anyone who can reach the port. Refused at construction. A relative
+        ipc path stays allowed — a consumer's default is one."""
+        with pytest.raises(ValueError, match="ipc"):
+            ProcessBridge("tcp://127.0.0.1:5555", ProcessBridge.Mode.SERVER)
+        with pytest.raises(ValueError, match="ipc"):
+            ProcessBridge("inproc://rpc", "client")
+        ProcessBridge("ipc://relative.sock", "client")
+
+
 class TestServerAddressOwnership:
     def test_closing_an_old_server_leaves_the_live_one_reachable(self):
         """libzmq unlinks an ipc path before binding it, so a replacement
