@@ -48,8 +48,7 @@ NEW, STARTING, RUNNING, STOPPING, DEAD = (
 )
 
 # How long a cancelled coroutine is given to unwind — by call() leaving early,
-# and by the teardown. Only a coroutine that ignores its cancellation runs it
-# out; the teardown abandons such a task rather than wait on it.
+# and by the teardown, which abandons whatever has not yielded to it by then.
 _UNWIND_GRACE = 6.0
 
 
@@ -259,8 +258,10 @@ class AsyncioThread:
           cancelled.
         - A call whose coroutine honours the cancellation raises
           :class:`LoopStopped`; one already handling a cancellation of its
-          own keeps its cleanup and its own answer or reason; one whose
-          coroutine finishes regardless gets its answer.
+          own keeps its cleanup and its own answer or reason — unless that
+          cleanup awaits a ``to_gevent``, whose kill ends the call with
+          :class:`LoopStopped`; one whose coroutine finishes regardless gets
+          its answer.
         - The whole teardown is bounded by ``_UNWIND_GRACE``: a task, async
           generator or executor thread that does not yield to it in that
           time is abandoned, and the loop is closed under it.
@@ -325,11 +326,11 @@ class AsyncioThread:
             # that task reads.
             for hub, kill in list(self._crossings.values()):
                 _schedule_on_hub(hub, kill, _TeardownExit)
-            # Teardown BEFORE anyone is told the loop is gone: cancelling a task
-            # queues the kill of the greenlet it awaited on its caller's hub,
-            # and the caller — a one-shot native thread, say — takes that hub
-            # with it the moment it has its answer. Each caller's answer
-            # follows its kill, in the same queue.
+            # Teardown BEFORE anyone is told the loop is gone: a crossing it
+            # ends queues a kill on its caller's hub, and the caller — a
+            # one-shot native thread, say — takes that hub with it the moment
+            # it has its answer. Each caller's answer follows its kill, in the
+            # same queue.
             if self._loop is not None:
                 _close(self._loop, self._torn, self._crossings)
             self._crossings.clear()  # what a crossing's own end did not pop: abandoned
