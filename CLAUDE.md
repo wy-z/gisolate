@@ -24,9 +24,6 @@ uv run isort --check src/
 
 # Type check
 uv run pyright
-
-# Dead code detection
-uv run vulture src/
 ```
 
 ## Architecture
