@@ -111,18 +111,21 @@ class TestLoop:
                     await asyncio.sleep(10)
                 finally:  # cancelled by the teardown, not destroyed pending
                     cleaned.append(True)
+            release = threading.Event()
             async def late_spawner():
-                # An executor future completing during the executor's shutdown
-                # creates a task: the teardown must end that one too.
+                # An executor future completing during the teardown creates a
+                # task: the teardown must end that one too. Released by the
+                # first cancellation below, not by a timer: a timed future
+                # landed after the grace on a shared runner, and proved nothing.
                 loop = asyncio.get_running_loop()
-                fut = loop.run_in_executor(None, time.sleep, 0.2)
+                fut = loop.run_in_executor(None, release.wait, 5)
                 fut.add_done_callback(lambda f: loop.create_task(cleanup()))
             async def immortal():
                 while True:
                     try:
                         await asyncio.sleep(10)
                     except asyncio.CancelledError:
-                        pass
+                        release.set()  # the teardown has begun: let the future land now
             async def hold_executor():
                 asyncio.get_running_loop().run_in_executor(None, time.sleep, 3)
             import gevent
