@@ -11,9 +11,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # 3.12 is out until #30 is settled: an original Thread never reports
-        # its exit under patch_all there, so every native-thread test fails
-        # and the run hangs at exit.
         python: ["3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25

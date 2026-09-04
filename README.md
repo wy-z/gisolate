@@ -14,7 +14,7 @@ gevent's `monkey.patch_all()` replaces stdlib modules globally. Some libraries (
 pip install gisolate
 ```
 
-Requires Python 3.12+.
+Requires Python 3.13+.
 
 ## Quick Start
 
