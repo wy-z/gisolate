@@ -170,9 +170,6 @@ class IpcLease:
         try:
             if file_id is not None:
                 st = os.stat(path)
-                # Field by field, not a built tuple: the comparison runs after
-                # ownership was detached, and the tuple was the one avoidable
-                # allocation left on this path.
                 if st.st_dev != file_id[0] or st.st_ino != file_id[1]:
                     self._path = self._file_id = None
                     return  # somebody rebound the address; it is theirs now
@@ -182,10 +179,8 @@ class IpcLease:
         except KeyboardInterrupt:
             raise  # the operator's; the claim stays for the retry
         except BaseException:  # noqa: BLE001
-            # Not just OSError: the stat's result is an allocation, and a
-            # MemoryError escaping here broke the never-raises contract inside
-            # somebody's finally. Whatever it was, the claim stays, so a later
-            # release can retry.
+            # Not just OSError: release() never raises. Whatever it was, the
+            # claim stays, so a later release can retry.
             return
         self._path = self._file_id = None
 
@@ -247,13 +242,6 @@ class ZmqTransport:
         :func:`gisolate.serve` in a process that survives it, where it wedges
         the next term(). LINGER is always 0; every transport in this package
         wants it, and a caller that forgets is a lost frame at shutdown.
-
-        Every allocation of its own comes FIRST — the carrier, and the blind
-        lease its rollback would hand it. The rollback then only stores and
-        closes: a version that allocated its way out could fail on the way,
-        stranding a bound socket with the original error replaced, and the
-        carrier built at the very end could itself be the allocation that
-        failed after everything had succeeded.
         """
         import zmq
 
@@ -309,10 +297,6 @@ class ZmqTransport:
         self._closed = True
         sock, ctx, lease = self.sock, self._ctx, self._lease
         self.sock = self._ctx = None
-        # try/except rather than contextlib.suppress: suppress is an
-        # allocation, and this is the one path that must not need one — a
-        # MemoryError building the guard would have skipped the close the
-        # guard was for.
         try:
             try:
                 if sock is not None:

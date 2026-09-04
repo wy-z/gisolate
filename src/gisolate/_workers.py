@@ -79,8 +79,6 @@ def safe_close(client: Any) -> None:
     runs the client's code just as close() does, and a SystemExit from there
     used to leave serve() by a route the call itself no longer could.
     """
-    # try/except, not suppress: the guard is an allocation, and this runs on
-    # teardown paths — see ZmqTransport.close for the rule.
     try:
         if close := getattr(client, "close", None):
             close()
@@ -118,11 +116,10 @@ def gevent_worker(cfg: WorkerConfig, patch_kwargs: dict):
     gevent.get_hub()
 
     # Everything that can fail is built before the transport exists — the
-    # loads, the locks, and every nested function object below (each def is an
-    # allocation of its own) — so no failure here can strand a bound socket
-    # outside the cleanup at the bottom: serve() runs this in a process that
-    # survives the exception. The defs close over ``sock`` and read it at call
-    # time, which is after the open.
+    # loads, the locks, and every nested function object below — so no failure
+    # here can strand a bound socket outside the cleanup at the bottom: serve()
+    # runs this in a process that survives the exception. The defs close over
+    # ``sock`` and read it at call time, which is after the open.
     factory = dill.loads(cfg.factory_bytes)
     client = None
     client_lock = gevent.lock.RLock()
@@ -650,10 +647,8 @@ def asyncio_worker(cfg: WorkerConfig):
                     # runs on to be disposed.
                     tasks.discard(pending)
                     while tasks:
-                        # Destructive pop, no list copy: the copy was an
-                        # allocation, and its refusal skipped both the cancels
-                        # and the dispose below. Nothing runs between pops —
-                        # done-callbacks only fire at the next await.
+                        # Nothing runs between pops — done-callbacks only
+                        # fire at the next await.
                         tasks.pop().cancel()
                     if not pending.done():
                         # wait(), not await: it neither cancels nor raises —

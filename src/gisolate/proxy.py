@@ -129,9 +129,6 @@ def _publish_failed_launch(popen: Any, process_obj: Any) -> None:
     pid = getattr(popen, "pid", None)
     if pid is None:
         return
-    # try/except rather than contextlib.suppress throughout: suppress is an
-    # allocation, and a MemoryError building the guard would have skipped the
-    # kill and reap the guard was for — leaving a child known to nothing.
     if getattr(popen, "sentinel", None) is None:
         # Finished here rather than handed on: every cleanup path in this
         # package joins, and join reads the sentinel this launcher never got to
@@ -242,9 +239,7 @@ def _launch_recoverably(process: Any) -> None:
     descriptors, or doing setup of its own — and replacing that would start a
     child without it.
     """
-    # Every launch first collects what an interrupted recovery left
-    # registered — here rather than on a teardown path, because the sweep
-    # allocates (the copy) and launch is allowed to.
+    # Every launch first collects what an interrupted recovery left registered.
     _reap_orphans()
     ours = _RECOVERABLE_LAUNCHERS.get(getattr(type(process), "_Popen", None))
     if ours is None:
@@ -618,9 +613,7 @@ class ProcessProxy(abc.ABC):
                 # attached proxy holds no lease, so a host's socket — which
                 # other clients are still using — is never ours to remove.
                 # Nested: release re-raises the operator's interrupt, and the
-                # waiters below must still learn the process is gone. Drained
-                # destructively — pop allocates nothing, where an iterator is
-                # a refusal that left every waiter running out its timeout.
+                # waiters below must still learn the process is gone.
                 try:
                     lease.release()
                 finally:

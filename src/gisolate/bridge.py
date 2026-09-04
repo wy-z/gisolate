@@ -64,8 +64,6 @@ class ProcessBridge:
         self._transport: _internal.ZmqTransport | None = None
 
     def __del__(self):
-        # try/except, not suppress: the guard is an allocation, and this is a
-        # cleanup path — see ZmqTransport.close for the rule.
         try:
             if getattr(self, "_started", False):
                 self.close()
@@ -335,8 +333,7 @@ class ProcessBridge:
             # The prelude allocates — a group, a semaphore, the handler's own
             # function object — and a refusal here died with _started still
             # true over the bound transport: start() no-opped for good. Same
-            # release the loop's own failure gets, allocating nothing on the
-            # way out.
+            # release the loop's own failure gets.
             if transport is self._transport:
                 self._started = False
                 self._transport = None
